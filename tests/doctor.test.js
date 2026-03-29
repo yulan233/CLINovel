@@ -19,3 +19,33 @@ test("describeLlmMode reports known context windows for supported models", () =>
   const llm = describeLlmMode({ default_model: "gpt-4.1-mini" });
   assert.equal(llm.contextWindow, 1047576);
 });
+
+test("describeLlmMode exposes stream timeout configuration", (t) => {
+  const originalEnv = {
+    AINOVEL_REQUEST_TIMEOUT_MS: process.env.AINOVEL_REQUEST_TIMEOUT_MS,
+    AINOVEL_STREAM_CONNECT_TIMEOUT_MS: process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS,
+    AINOVEL_STREAM_IDLE_TIMEOUT_MS: process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS
+  };
+  process.env.AINOVEL_REQUEST_TIMEOUT_MS = "90000";
+  process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS = "45000";
+  process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS = "25000";
+
+  t.after(() => {
+    restoreEnv(originalEnv);
+  });
+
+  const llm = describeLlmMode({ default_model: "gpt-4.1-mini" });
+  assert.equal(llm.timeoutMs, 90000);
+  assert.equal(llm.streamConnectTimeoutMs, 45000);
+  assert.equal(llm.streamIdleTimeoutMs, 25000);
+});
+
+function restoreEnv(snapshot) {
+  for (const [key, value] of Object.entries(snapshot)) {
+    if (value === undefined) {
+      delete process.env[key];
+    } else {
+      process.env[key] = value;
+    }
+  }
+}

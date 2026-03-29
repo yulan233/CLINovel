@@ -128,7 +128,9 @@ async function handleDoctor(runtime) {
     ["AINOVEL_MODEL", llm.model || "missing"],
     ["LLM context_window", llm.contextWindow ? String(llm.contextWindow) : "unknown"],
     ["LLM mode", llm.remoteEnabled ? "remote" : "fallback-local"],
-    ["LLM timeout_ms", String(llm.timeoutMs)]
+    ["LLM timeout_ms", String(llm.timeoutMs)],
+    ["LLM stream_connect_timeout_ms", String(llm.streamConnectTimeoutMs)],
+    ["LLM stream_idle_timeout_ms", String(llm.streamIdleTimeoutMs)]
   ];
 
   const output = [
@@ -166,7 +168,10 @@ async function handleConfig(runtime) {
     `base_url: ${llm.baseUrl}`,
     `api_key: ${llm.maskedApiKey}`,
     `context_window: ${llm.contextWindow || "unknown"}`,
-    `mode: ${llm.remoteEnabled ? "remote" : "fallback-local"}`
+    `mode: ${llm.remoteEnabled ? "remote" : "fallback-local"}`,
+    `timeout_ms: ${llm.timeoutMs}`,
+    `stream_connect_timeout_ms: ${llm.streamConnectTimeoutMs}`,
+    `stream_idle_timeout_ms: ${llm.streamIdleTimeoutMs}`
   ].join("\n");
   printRuntime(runtime, output);
   return { output, config, llm };

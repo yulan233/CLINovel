@@ -11,7 +11,10 @@ test("doctor reports the loaded env file path", async (t) => {
   const originalEnv = {
     AINOVEL_API_KEY: process.env.AINOVEL_API_KEY,
     AINOVEL_BASE_URL: process.env.AINOVEL_BASE_URL,
-    AINOVEL_MODEL: process.env.AINOVEL_MODEL
+    AINOVEL_MODEL: process.env.AINOVEL_MODEL,
+    AINOVEL_REQUEST_TIMEOUT_MS: process.env.AINOVEL_REQUEST_TIMEOUT_MS,
+    AINOVEL_STREAM_CONNECT_TIMEOUT_MS: process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS,
+    AINOVEL_STREAM_IDLE_TIMEOUT_MS: process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS
   };
   const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-doctor-env-"));
   await initProject(root, "doctor-demo");
@@ -29,6 +32,35 @@ test("doctor reports the loaded env file path", async (t) => {
   });
 
   assert.match(result.output, new RegExp(`${escapeRegex(path.join(root, ".env"))}`));
+});
+
+test("doctor reports stream timeout configuration", async (t) => {
+  const originalEnv = {
+    AINOVEL_API_KEY: process.env.AINOVEL_API_KEY,
+    AINOVEL_BASE_URL: process.env.AINOVEL_BASE_URL,
+    AINOVEL_MODEL: process.env.AINOVEL_MODEL,
+    AINOVEL_REQUEST_TIMEOUT_MS: process.env.AINOVEL_REQUEST_TIMEOUT_MS,
+    AINOVEL_STREAM_CONNECT_TIMEOUT_MS: process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS,
+    AINOVEL_STREAM_IDLE_TIMEOUT_MS: process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS
+  };
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-doctor-timeout-"));
+  await initProject(root, "doctor-timeout-demo");
+
+  process.env.AINOVEL_MODEL = "gpt-4.1-mini";
+  process.env.AINOVEL_REQUEST_TIMEOUT_MS = "90000";
+  process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS = "45000";
+  process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS = "25000";
+
+  t.after(() => restoreEnv(originalEnv));
+
+  const result = await runCommand(["doctor"], {
+    rootDir: root,
+    print: false
+  });
+
+  assert.match(result.output, /LLM timeout_ms: 90000/);
+  assert.match(result.output, /LLM stream_connect_timeout_ms: 45000/);
+  assert.match(result.output, /LLM stream_idle_timeout_ms: 25000/);
 });
 
 test("export rejects output paths outside the project root", async () => {

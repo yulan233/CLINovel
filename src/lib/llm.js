@@ -9,11 +9,20 @@ const DEFAULT_RETRY_DELAY_MS = 400;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 export function getLlmConfig(projectConfig = {}) {
+  const timeoutMs = readPositiveInt(process.env.AINOVEL_REQUEST_TIMEOUT_MS || projectConfig.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS);
   return {
     model: process.env.AINOVEL_MODEL || projectConfig.default_model || DEFAULT_MODEL,
     apiKey: process.env.AINOVEL_API_KEY || "",
     baseUrl: process.env.AINOVEL_BASE_URL || DEFAULT_BASE_URL,
-    timeoutMs: readPositiveInt(process.env.AINOVEL_REQUEST_TIMEOUT_MS || projectConfig.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS)
+    timeoutMs,
+    streamConnectTimeoutMs: readPositiveInt(
+      process.env.AINOVEL_STREAM_CONNECT_TIMEOUT_MS || projectConfig.stream_connect_timeout_ms,
+      timeoutMs
+    ),
+    streamIdleTimeoutMs: readPositiveInt(
+      process.env.AINOVEL_STREAM_IDLE_TIMEOUT_MS || projectConfig.stream_idle_timeout_ms,
+      DEFAULT_STREAM_IDLE_TIMEOUT_MS
+    )
   };
 }
 
@@ -63,10 +72,20 @@ export async function streamText(task, prompt, projectConfig = {}, observer = {}
   const onToken = observer.onToken || (() => {});
   const onComplete = observer.onComplete || (() => {});
   const onStart = observer.onStart || (() => {});
+  const streamConnectTimeoutMs = readPositiveInt(
+    observer.streamConnectTimeoutMs ?? observer.timeoutMs,
+    config.streamConnectTimeoutMs
+  );
+  const streamIdleTimeoutMs = readPositiveInt(
+    observer.streamChunkTimeoutMs ?? observer.streamIdleTimeoutMs,
+    config.streamIdleTimeoutMs
+  );
 
   onStart({
     model: config.model,
-    remoteEnabled: Boolean(config.apiKey) && config.model !== "fallback-local"
+    remoteEnabled: Boolean(config.apiKey) && config.model !== "fallback-local",
+    streamConnectTimeoutMs,
+    streamIdleTimeoutMs
   });
 
   if (!config.apiKey || config.model === "fallback-local") {
@@ -91,6 +110,9 @@ export async function streamText(task, prompt, projectConfig = {}, observer = {}
     const decoder = new TextDecoder();
     let buffer = "";
     let text = "";
+    let hasReceivedChunk = false;
+
+    request.clearTimeout();
 
     try {
       while (true) {
@@ -100,12 +122,14 @@ export async function streamText(task, prompt, projectConfig = {}, observer = {}
 
         const { value, done } = await readStreamChunkWithTimeout(
           reader,
-          readPositiveInt(observer.streamChunkTimeoutMs, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
-          request
+          hasReceivedChunk ? streamIdleTimeoutMs : streamConnectTimeoutMs,
+          request,
+          hasReceivedChunk ? "idle" : "connect"
         );
         if (done) {
           break;
         }
+        hasReceivedChunk = true;
 
         buffer += decoder.decode(value, { stream: true });
         const chunks = buffer.split("\n\n");
@@ -166,7 +190,7 @@ export async function streamText(task, prompt, projectConfig = {}, observer = {}
 
 async function executeChatCompletionRequest(task, prompt, config, options, consumeResponse) {
   const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
-  const timeoutMs = readPositiveInt(options.timeoutMs, config.timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS);
+  const timeoutMs = readPositiveInt(options.timeoutMs, config.timeoutMs);
   const maxRetries = readPositiveInt(options.maxRetries, DEFAULT_MAX_RETRIES);
   const retryDelayMs = readPositiveInt(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
   let attempt = 0;
@@ -234,19 +258,23 @@ async function buildHttpError(response) {
   return new Error(`LLM request failed (${response.status}): ${body}`);
 }
 
-async function readStreamChunkWithTimeout(reader, idleTimeoutMs, request) {
-  if (!idleTimeoutMs) {
+async function readStreamChunkWithTimeout(reader, timeoutMs, request, stage = "idle") {
+  if (!timeoutMs) {
     return reader.read();
   }
 
   let timeoutId = null;
-  const stalledError = timeoutError(`LLM stream stalled for ${idleTimeoutMs}ms`);
+  const stalledError = timeoutError(
+    stage === "connect"
+      ? `LLM stream did not start after ${timeoutMs}ms`
+      : `LLM stream stalled for ${timeoutMs}ms`
+  );
   const timeoutPromise = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
       request.abort(stalledError);
       Promise.resolve(reader.cancel(stalledError)).catch(() => {});
       reject(stalledError);
-    }, idleTimeoutMs);
+    }, timeoutMs);
     timeoutId.unref?.();
   });
 
@@ -278,19 +306,34 @@ function createRequestContext(externalSignal, timeoutMs) {
     }
   }
 
+  const clearTimeoutHandle = () => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+      timeoutId = null;
+    }
+  };
+
+  const setTimeoutHandle = (ms, reason) => {
+    clearTimeoutHandle();
+    if (ms > 0) {
+      timeoutId = setTimeout(() => abort(reason), ms);
+      timeoutId.unref?.();
+    }
+  };
+
   if (timeoutMs > 0) {
-    const reason = timeoutError(`LLM request timed out after ${timeoutMs}ms`);
-    timeoutId = setTimeout(() => abort(reason), timeoutMs);
-    timeoutId.unref?.();
+    setTimeoutHandle(timeoutMs, timeoutError(`LLM request timed out after ${timeoutMs}ms`));
   }
 
   return {
     signal: controller.signal,
     abort,
+    clearTimeout: clearTimeoutHandle,
+    setTimeout(ms, reason) {
+      setTimeoutHandle(ms, reason);
+    },
     cleanup() {
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      clearTimeoutHandle();
       for (const fn of cleanupFns) {
         fn();
       }
