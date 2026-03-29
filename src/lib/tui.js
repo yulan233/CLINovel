@@ -66,7 +66,6 @@ const GUIDE_STEPS = [
 const ANSI_ESCAPE_PATTERN = /\u001B(?:\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])/g;
 const CONTEXT_REFRESH_TASKS = new Set(["chapter-plan", "draft", "chapter-revise", "chapter-rewrite", "plot-options"]);
 const DETAILS_POLL_INTERVAL_MS = 400;
-const DETAILS_POLL_INTERVAL_GENERATING_MS = 2000;
 const STREAM_FLUSH_INTERVAL_MS = 60;
 const USAGE_ANIMATION_DURATION_MS = 160;
 const USAGE_ANIMATION_INTERVAL_MS = 24;
@@ -237,9 +236,17 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
       return undefined;
     }
 
+    // Skip periodic polling while streaming – loadDetailsSnapshot is CPU-heavy
+    // (tiktoken encoding of all context sections) and blocks the event loop,
+    // causing the TUI to freeze.  Details are still refreshed on artifact_written
+    // events and once the task finishes (task-finally).
+    if (isStreamingTask) {
+      return undefined;
+    }
+
     const timer = setInterval(() => {
       void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, `poll:${activeTask}`);
-    }, isStreamingTask ? DETAILS_POLL_INTERVAL_GENERATING_MS : DETAILS_POLL_INTERVAL_MS);
+    }, DETAILS_POLL_INTERVAL_MS);
 
     return () => clearInterval(timer);
   }, [activeTask, isStreamingTask]);
@@ -1230,13 +1237,16 @@ export async function loadDetailsSnapshot(
 
   try {
     const paths = resolveProjectPathsFn(rootDir);
-    const [contextSections, intent, memory, structured, config] = await Promise.all([
+    const [contextSections, intent, memory] = await Promise.all([
       buildContextSectionsFn(rootDir, chapterId),
       buildIntentContextFn(rootDir, chapterId),
-      readTextFn(`${paths.memoryChaptersDir}/${chapterId}.summary.md`, ""),
-      loadStructuredMemoryFn(rootDir),
-      loadProjectConfigFn(rootDir)
+      readTextFn(`${paths.memoryChaptersDir}/${chapterId}.summary.md`, "")
     ]);
+    // Reuse config & structured data already loaded by buildContextSections
+    // to avoid duplicate file reads, JSON parses, and tiktoken encoding.
+    const assembled = contextSections._assembled;
+    const config = assembled?.config || await loadProjectConfigFn(rootDir);
+    const structured = assembled?.structured || await loadStructuredMemoryFn(rootDir);
     const llm = describeLlmMode(config);
     const promptSections = contextSections
       .filter((section) => section.text)
@@ -1832,7 +1842,6 @@ export function buildTranscriptLines(history, width, options = {}) {
 }
 
 function wrapTranscriptItem(item, width, options = {}) {
-  const formatted = formatTranscriptLine(item);
   const cacheKey = getTranscriptWrapCacheKey(item, width);
   if (cacheKey && options.wrapCache?.has(cacheKey)) {
     return options.wrapCache.get(cacheKey);
@@ -1840,6 +1849,12 @@ function wrapTranscriptItem(item, width, options = {}) {
   if (item?.streaming) {
     const streamingCacheKey = getStreamingTranscriptWrapCacheKey(item, width);
     const cachedStreaming = streamingCacheKey ? options.streamingWrapCache?.get(streamingCacheKey) : null;
+    // Fast path: build formatted text incrementally for streaming items.
+    // If the raw text only appended (common case), re-use the cached
+    // normalised prefix and only normalise the new suffix.
+    const formatted = cachedStreaming?.rawText != null && item.text?.startsWith(cachedStreaming.rawText)
+      ? `${cachedStreaming.text}${normalizeTranscriptText(item.text.slice(cachedStreaming.rawText.length))}`
+      : formatTranscriptLine(item);
     if (cachedStreaming?.text === formatted) {
       return cachedStreaming.wrapped;
     }
@@ -1849,11 +1864,12 @@ function wrapTranscriptItem(item, width, options = {}) {
         line
       }));
       if (streamingCacheKey && options.streamingWrapCache) {
-        options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped });
+        options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped, rawText: item.text });
       }
       return wrapped;
     }
   }
+  const formatted = formatTranscriptLine(item);
 
   const wrapped = wrapTextLines(formatted, width).map((line) => ({
     role: item.role,
@@ -1864,7 +1880,7 @@ function wrapTranscriptItem(item, width, options = {}) {
   }
   const streamingCacheKey = item?.streaming ? getStreamingTranscriptWrapCacheKey(item, width) : null;
   if (streamingCacheKey && options.streamingWrapCache) {
-    options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped });
+    options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped, rawText: item.text });
   }
   return wrapped;
 }

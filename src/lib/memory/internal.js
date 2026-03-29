@@ -19,7 +19,9 @@ export async function buildContext(rootDir, chapterId, options = {}) {
 
 export async function buildContextSections(rootDir, chapterId, options = {}) {
   const assembled = await buildAssembledContext(rootDir, chapterId, options);
-  return assembled.sections.filter((section) => section.included && section.text);
+  const sections = assembled.sections.filter((section) => section.included && section.text);
+  sections._assembled = assembled;
+  return sections;
 }
 
 export async function buildAssembledContext(rootDir, chapterId, options = {}) {
@@ -86,6 +88,7 @@ export async function buildAssembledContext(rootDir, chapterId, options = {}) {
   return {
     budget,
     model,
+    config,
     sections: applied,
     structured,
     usage
