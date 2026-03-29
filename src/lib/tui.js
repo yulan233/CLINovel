@@ -28,11 +28,14 @@ const STREAMING_TASKS = new Set([
   "plot-options"
 ]);
 const INSPECTOR_VIEWS = ["status", "context", "memory", "plot", "artifacts", "loops", "warnings", "entity"];
-const MAX_HISTORY_ITEMS = 80;
+const MAX_HISTORY_ITEMS = 40;
+const MAX_TOTAL_HISTORY_CHARS = 120000;
 const MAX_MESSAGE_CHARS = 6000;
+const MAX_TRANSCRIPT_RENDER_LINES = 200;
 const MAX_SUGGESTION_ROWS = 4;
 const PANEL_HORIZONTAL_CHROME = 4;
 const INPUT_PROMPT = "> ";
+const TRANSCRIPT_TRUNCATION_NOTICE = "更早消息已截断，以保持终端流畅。";
 const GUIDE_STEPS = [
   {
     key: "genreAndTone",
@@ -63,6 +66,8 @@ const GUIDE_STEPS = [
 const ANSI_ESCAPE_PATTERN = /\u001B(?:\[[0-9;?]*[ -/]*[@-~]|[@-Z\\-_])/g;
 const CONTEXT_REFRESH_TASKS = new Set(["chapter-plan", "draft", "chapter-revise", "chapter-rewrite", "plot-options"]);
 const DETAILS_POLL_INTERVAL_MS = 400;
+const DETAILS_POLL_INTERVAL_GENERATING_MS = 2000;
+const STREAM_FLUSH_INTERVAL_MS = 60;
 const USAGE_ANIMATION_DURATION_MS = 160;
 const USAGE_ANIMATION_INTERVAL_MS = 24;
 
@@ -123,13 +128,10 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
   const { exit } = useApp();
   const [input, setInput] = useState("");
   const [inputVersion, setInputVersion] = useState(0);
-  const [history, setHistory] = useState([
-    {
-      role: "system",
-      text: buildWelcomeMessage(renderProfile),
-      streaming: false
-    }
-  ]);
+  const [historyState, setHistoryState] = useState(() => ({
+    items: [createHistoryItem("system", buildWelcomeMessage(renderProfile))],
+    wasPruned: false
+  }));
   const [uiState, dispatchUi] = useReducer(tuiStateReducer, undefined, createInitialTuiState);
   const {
     currentChapterId,
@@ -148,6 +150,9 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     guideSession,
     transcriptScroll
   } = uiState;
+  const history = historyState.items;
+  const historyWasPruned = historyState.wasPruned;
+  const isStreamingTask = Boolean(activeTask && STREAMING_TASKS.has(activeTask));
   const setCurrentChapterId = createUiSetter(dispatchUi, "currentChapterId");
   const setActiveTask = createUiSetter(dispatchUi, "activeTask");
   const setTaskPhase = createUiSetter(dispatchUi, "taskPhase");
@@ -176,6 +181,13 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     pendingChapterId: null,
     requestId: 0
   });
+  const streamBufferRef = useRef({
+    chunks: [],
+    timer: null
+  });
+  const streamingWrapCacheRef = useRef(new Map());
+  const isStreamingRef = useRef(false);
+  const transcriptWrapCacheRef = useRef(new Map());
   const latestStateRef = useRef({
     currentChapterId: null,
     activeTask: null,
@@ -227,16 +239,28 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
 
     const timer = setInterval(() => {
       void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, `poll:${activeTask}`);
-    }, DETAILS_POLL_INTERVAL_MS);
+    }, isStreamingTask ? DETAILS_POLL_INTERVAL_GENERATING_MS : DETAILS_POLL_INTERVAL_MS);
 
     return () => clearInterval(timer);
-  }, [activeTask]);
+  }, [activeTask, isStreamingTask]);
+
+  useEffect(() => {
+    isStreamingRef.current = isStreamingTask;
+  }, [isStreamingTask]);
+
+  useEffect(() => {
+    pruneTranscriptWrapCache(transcriptWrapCacheRef.current, history);
+    pruneTranscriptWrapCache(streamingWrapCacheRef.current, history);
+  }, [history]);
 
   useEffect(
     () => () => {
       if (usageAnimationRef.current.timer) {
         clearInterval(usageAnimationRef.current.timer);
       }
+      clearStreamingFlushTimer(streamBufferRef.current);
+      streamBufferRef.current.chunks = [];
+      streamingWrapCacheRef.current.clear();
     },
     []
   );
@@ -416,6 +440,12 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     if (usageAnimationRef.current.timer) {
       clearInterval(usageAnimationRef.current.timer);
       usageAnimationRef.current.timer = null;
+    }
+
+    if (isStreamingRef.current) {
+      displayUsageRef.current = targetUsage;
+      setDisplayUsage(targetUsage);
+      return;
     }
 
     if (!hasUsageDelta(currentUsage, targetUsage)) {
@@ -673,6 +703,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
 
       setLastResult(result?.output || "Done.");
     } catch (error) {
+      endStreamingSession();
       if (error.name === "AbortError" || error.message === "Generation aborted") {
         pushMessage("system", "Generation aborted.");
         setLastResult("Generation aborted.");
@@ -681,6 +712,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
         setLastResult(`Error: ${error.message}`);
       }
     } finally {
+      endStreamingSession();
       abortRef.current = null;
       setActiveTask(null);
       setTaskPhase("idle");
@@ -700,6 +732,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
               pushMessage("event", formatTaskStarted(event.task));
               if (STREAMING_TASKS.has(event.task)) {
                 streamed = true;
+                isStreamingRef.current = true;
                 pushMessage("assistant", "", { streaming: true });
               }
               break;
@@ -736,6 +769,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
               void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "plot-applied");
               break;
             case "task_completed":
+              endStreamingSession();
               setLastResult(event.output || "Done.");
               pushMessage("result", event.output || "Done.");
               break;
@@ -844,6 +878,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
       setLastCommand(["guid"]);
       setLastResult(result?.output || "Done.");
     } catch (error) {
+      endStreamingSession();
       if (error.name === "AbortError" || error.message === "Generation aborted") {
         pushMessage("system", "Generation aborted.");
         setLastResult("Generation aborted.");
@@ -852,6 +887,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
         setLastResult(`Error: ${error.message}`);
       }
     } finally {
+      endStreamingSession();
       abortRef.current = null;
       setActiveTask(null);
       setTaskPhase("idle");
@@ -870,6 +906,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
               setTaskPhase("started");
               pushMessage("event", formatTaskStarted(event.task));
               if (STREAMING_TASKS.has(event.task)) {
+                isStreamingRef.current = true;
                 pushMessage("assistant", "", { streaming: true });
               }
               break;
@@ -885,6 +922,7 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
               pushMessage("event", `Saved ${trimPath(event.artifact)}.`);
               break;
             case "task_completed":
+              endStreamingSession();
               setLastResult(event.output || "Done.");
               pushMessage("result", event.output || "Done.");
               break;
@@ -900,7 +938,10 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
   }
 
   function pushMessage(role, text, options = {}) {
-    setHistory((current) => [...current, createHistoryItem(role, text, options)].slice(-MAX_HISTORY_ITEMS));
+    if (!(role === "assistant" && options.streaming)) {
+      flushStreamingBuffer();
+    }
+    updateHistory((current) => [...current, createHistoryItem(role, text, options)]);
     setTranscriptScroll((current) => (current === 0 ? 0 : current));
   }
 
@@ -930,19 +971,13 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     if (!chunk) {
       return;
     }
-    setHistory((current) => {
-      const copy = [...current];
-      const last = copy[copy.length - 1];
-      if (!last || last.role !== "assistant" || !last.streaming) {
-        copy.push(createHistoryItem("assistant", chunk, { streaming: true }));
-      } else {
-        copy[copy.length - 1] = {
-          ...last,
-          ...clampMessageText(`${last.text}${chunk}`)
-        };
-      }
-      return copy.slice(-MAX_HISTORY_ITEMS);
-    });
+    streamBufferRef.current.chunks.push(chunk);
+    if (!streamBufferRef.current.timer) {
+      streamBufferRef.current.timer = setTimeout(() => {
+        streamBufferRef.current.timer = null;
+        flushStreamingBuffer();
+      }, STREAM_FLUSH_INTERVAL_MS);
+    }
     setTranscriptScroll((current) => (current === 0 ? 0 : current));
   }
 
@@ -969,9 +1004,12 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     plotState,
     inspectorView,
     transcriptScroll,
+    historyWasPruned,
     selectedEntity,
     plotSession,
-    guideSession
+    guideSession,
+    transcriptWrapCache: transcriptWrapCacheRef.current,
+    streamingWrapCache: streamingWrapCacheRef.current
   });
 
   function handleInputChange(nextValue) {
@@ -991,6 +1029,70 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
       setHistoryCursor(null);
       setDraftInput("");
     }
+  }
+
+  function updateHistory(mutator) {
+    setHistoryState((current) => {
+      const nextItems = typeof mutator === "function" ? mutator(current.items) : mutator;
+      if (nextItems === current.items) {
+        return current;
+      }
+      const nextHistory = pruneHistory(nextItems);
+      const nextWasPruned = current.wasPruned || nextHistory.wasPruned;
+      if (nextHistory.items === current.items && nextWasPruned === current.wasPruned) {
+        return current;
+      }
+      return {
+        items: nextHistory.items,
+        wasPruned: nextWasPruned
+      };
+    });
+  }
+
+  function flushStreamingBuffer() {
+    clearStreamingFlushTimer(streamBufferRef.current);
+    const merged = streamBufferRef.current.chunks.join("");
+    if (!merged) {
+      return;
+    }
+    streamBufferRef.current.chunks = [];
+    updateHistory((current) => {
+      const copy = [...current];
+      const last = copy[copy.length - 1];
+      if (!last || last.role !== "assistant" || !last.streaming) {
+        copy.push(createHistoryItem("assistant", merged, { streaming: true }));
+      } else {
+        copy[copy.length - 1] = {
+          ...last,
+          ...clampMessageText(`${last.text}${merged}`)
+        };
+      }
+      return copy;
+    });
+  }
+
+  function endStreamingSession() {
+    flushStreamingBuffer();
+    isStreamingRef.current = false;
+    updateHistory((current) => {
+      const last = current[current.length - 1];
+      if (!last || last.role !== "assistant" || !last.streaming) {
+        return current;
+      }
+
+      const copy = [...current];
+      if (!last.text) {
+        copy.pop();
+        return copy;
+      }
+
+      copy[copy.length - 1] = {
+        ...last,
+        streaming: false
+      };
+      pruneTranscriptWrapCache(streamingWrapCacheRef.current, copy);
+      return copy;
+    });
   }
 }
 
@@ -1227,33 +1329,65 @@ function MainLayout(props) {
     plotState,
     inspectorView,
     transcriptScroll,
+    historyWasPruned,
     selectedEntity,
     plotSession,
-    guideSession
+    guideSession,
+    transcriptWrapCache,
+    streamingWrapCache
   } = props;
 
   const cols = process.stdout.columns || 120;
   const rows = process.stdout.rows || 40;
-  const layout = computeLayoutFrames({ rows, cols, suggestionCount: visibleSuggestions.length });
+  const layout = useMemo(
+    () => computeLayoutFrames({ rows, cols, suggestionCount: visibleSuggestions.length }),
+    [rows, cols, visibleSuggestions.length]
+  );
   const leftWidth = cols - layout.sidebarWidth;
   const transcriptContentWidth = getPanelContentWidth(leftWidth);
   const transcriptViewportHeight = Math.max(1, layout.bodyHeight - 2);
-  const transcriptWindow = getTranscriptWindow(history, transcriptContentWidth, transcriptViewportHeight, transcriptScroll);
+  const transcriptWindow = useMemo(
+    () =>
+      getTranscriptWindow(history, transcriptContentWidth, transcriptViewportHeight, transcriptScroll, {
+        historyWasPruned,
+        wrapCache: transcriptWrapCache,
+        streamingWrapCache
+      }),
+    [
+      history,
+      transcriptContentWidth,
+      transcriptViewportHeight,
+      transcriptScroll,
+      historyWasPruned,
+      transcriptWrapCache,
+      streamingWrapCache
+    ]
+  );
   const transcriptHeader = `Transcript ${transcriptWindow.hiddenAbove > 0 ? `↑${transcriptWindow.hiddenAbove} ` : ""}${transcriptWindow.hiddenBelow > 0 ? `↓${transcriptWindow.hiddenBelow}` : ""}`.trim();
-  const summaryLines = buildSummaryLines({ cols, currentChapterId, project, plotState, lastResult, activeTask, taskPhase });
-  const sidebarPanels = buildSidebarPanels({
-    bodyHeight: layout.bodyHeight,
-    cols: layout.sidebarWidth,
-    currentChapterId,
-    project,
-    details,
-    plotState,
-    lastArtifacts,
-    inspectorView,
-    selectedEntity,
-    plotSession
-  });
-  const suggestionWindow = getSuggestionWindow(visibleSuggestions, suggestionIndex, layout.suggestionRows);
+  const summaryLines = useMemo(
+    () => buildSummaryLines({ cols, currentChapterId, project, plotState, lastResult, activeTask, taskPhase }),
+    [cols, currentChapterId, project, plotState, lastResult, activeTask, taskPhase]
+  );
+  const sidebarPanels = useMemo(
+    () =>
+      buildSidebarPanels({
+        bodyHeight: layout.bodyHeight,
+        cols: layout.sidebarWidth,
+        currentChapterId,
+        project,
+        details,
+        plotState,
+        lastArtifacts,
+        inspectorView,
+        selectedEntity,
+        plotSession
+      }),
+    [layout.bodyHeight, layout.sidebarWidth, currentChapterId, project, details, plotState, lastArtifacts, inspectorView, selectedEntity, plotSession]
+  );
+  const suggestionWindow = useMemo(
+    () => getSuggestionWindow(visibleSuggestions, suggestionIndex, layout.suggestionRows),
+    [visibleSuggestions, suggestionIndex, layout.suggestionRows]
+  );
   const visibleSuggestionsList = suggestionWindow.items;
 
   return h(
@@ -1634,9 +1768,14 @@ export function buildInputHelp({ visibleSuggestionsCount = 0, plotSession = null
   return "Enter 提交，输入 / 查看命令，上下键切换最近 10 条命令，PgUp/PgDn 滚动消息区，Ctrl+O 聚焦详情面板，左右键切换详情，Esc 退出详情，Ctrl+C 停止/退出";
 }
 
-export function getTranscriptWindow(history, width, height, scrollOffset = 0) {
-  const allLines = buildTranscriptLines(history, width);
+export function getTranscriptWindow(history, width, height, scrollOffset = 0, options = {}) {
   const visibleHeight = Math.max(1, height);
+  const allLines = buildTranscriptLines(history, width, {
+    maxLines: Math.max(MAX_TRANSCRIPT_RENDER_LINES, visibleHeight),
+    historyWasPruned: options.historyWasPruned,
+    wrapCache: options.wrapCache,
+    streamingWrapCache: options.streamingWrapCache
+  });
   const maxScroll = Math.max(0, allLines.length - visibleHeight);
   const safeScroll = Math.min(Math.max(0, scrollOffset), maxScroll);
   const end = allLines.length - safeScroll;
@@ -1650,19 +1789,92 @@ export function getTranscriptWindow(history, width, height, scrollOffset = 0) {
   };
 }
 
-function buildTranscriptLines(history, width) {
-  const lines = history.flatMap((item) =>
-    wrapTextLines(formatTranscriptLine(item), width).map((line) => ({
-      role: item.role,
-      line
-    }))
-  );
+export function buildTranscriptLines(history, width, options = {}) {
+  const maxLines = Number.isFinite(options.maxLines) ? Math.max(1, Math.floor(options.maxLines)) : Number.POSITIVE_INFINITY;
+  const items = Array.isArray(history) ? history : [];
+  const chunks = [];
+  let remaining = maxLines;
+  let trimmedTrailingBlankLines = false;
+  let truncated = false;
 
-  while (lines.length > 1 && isBlankLine(lines.at(-1)?.line)) {
-    lines.pop();
+  // Walk backward so transcript rendering stays bounded even in long sessions.
+  for (let index = items.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    let itemLines = wrapTranscriptItem(items[index], width, options);
+    if (!trimmedTrailingBlankLines) {
+      itemLines = trimTrailingBlankTranscriptLines(itemLines);
+      trimmedTrailingBlankLines = true;
+    }
+    if (itemLines.length === 0) {
+      continue;
+    }
+    if (itemLines.length > remaining) {
+      chunks.push(itemLines.slice(-remaining));
+      truncated = true;
+      remaining = 0;
+      break;
+    }
+    chunks.push(itemLines);
+    remaining -= itemLines.length;
+    if (remaining === 0 && index > 0) {
+      truncated = true;
+      break;
+    }
   }
 
-  return lines;
+  const lines = chunks.reverse().flat();
+  if (!truncated && !options.historyWasPruned) {
+    return lines;
+  }
+
+  const noticeLines = wrapTranscriptItem({ role: "system", text: TRANSCRIPT_TRUNCATION_NOTICE }, width);
+  const contentBudget = Math.max(0, maxLines - noticeLines.length);
+  return [...noticeLines, ...lines.slice(-contentBudget)];
+}
+
+function wrapTranscriptItem(item, width, options = {}) {
+  const formatted = formatTranscriptLine(item);
+  const cacheKey = getTranscriptWrapCacheKey(item, width);
+  if (cacheKey && options.wrapCache?.has(cacheKey)) {
+    return options.wrapCache.get(cacheKey);
+  }
+  if (item?.streaming) {
+    const streamingCacheKey = getStreamingTranscriptWrapCacheKey(item, width);
+    const cachedStreaming = streamingCacheKey ? options.streamingWrapCache?.get(streamingCacheKey) : null;
+    if (cachedStreaming?.text === formatted) {
+      return cachedStreaming.wrapped;
+    }
+    if (cachedStreaming?.wrapped && formatted.startsWith(cachedStreaming.text)) {
+      const wrapped = appendWrappedTranscriptLines(cachedStreaming.wrapped, formatted, cachedStreaming.text, width).map((line) => ({
+        role: item.role,
+        line
+      }));
+      if (streamingCacheKey && options.streamingWrapCache) {
+        options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped });
+      }
+      return wrapped;
+    }
+  }
+
+  const wrapped = wrapTextLines(formatted, width).map((line) => ({
+    role: item.role,
+    line
+  }));
+  if (cacheKey && options.wrapCache) {
+    options.wrapCache.set(cacheKey, wrapped);
+  }
+  const streamingCacheKey = item?.streaming ? getStreamingTranscriptWrapCacheKey(item, width) : null;
+  if (streamingCacheKey && options.streamingWrapCache) {
+    options.streamingWrapCache.set(streamingCacheKey, { text: formatted, wrapped });
+  }
+  return wrapped;
+}
+
+function trimTrailingBlankTranscriptLines(lines) {
+  const copy = [...lines];
+  while (copy.length > 1 && isBlankLine(copy.at(-1)?.line)) {
+    copy.pop();
+  }
+  return copy;
 }
 
 function buildStatusLines(project, currentChapterId, cols) {
@@ -1987,24 +2199,104 @@ function getVisibleWidth(text) {
   return stringWidth(String(text || ""));
 }
 
-function sliceByVisibleWidth(text, width) {
+function getTranscriptWrapCacheKey(item, width) {
+  if (!item?.id || item.streaming) {
+    return null;
+  }
+  return `${item.id}:${item.role}:${String(item.text || "").length}:${Math.max(8, Math.floor(Number(width) || 0))}`;
+}
+
+function getStreamingTranscriptWrapCacheKey(item, width) {
+  if (!item?.id || !item.streaming) {
+    return null;
+  }
+  return `${item.id}:${item.role}:${Math.max(8, Math.floor(Number(width) || 0))}`;
+}
+
+function appendWrappedTranscriptLines(previousWrapped, nextFormatted, previousFormatted, width) {
+  const existingLines = (previousWrapped || []).map((item) => item.line);
+  if (!existingLines.length) {
+    return wrapTextLines(nextFormatted, width);
+  }
+
+  const suffix = nextFormatted.slice(previousFormatted.length);
+  if (!suffix) {
+    return existingLines;
+  }
+
+  const baseLines = existingLines.slice(0, -1);
+  const tail = `${existingLines.at(-1) || ""}${suffix}`;
+  return [...baseLines, ...wrapTextLines(tail, width)];
+}
+
+function pruneTranscriptWrapCache(cache, history) {
+  if (!(cache instanceof Map) || cache.size === 0) {
+    return;
+  }
+  const validIds = new Set((history || []).map((item) => item?.id).filter(Boolean));
+  for (const key of cache.keys()) {
+    const separator = key.indexOf(":");
+    const itemId = separator === -1 ? key : key.slice(0, separator);
+    if (!validIds.has(itemId)) {
+      cache.delete(key);
+    }
+  }
+}
+
+function clearStreamingFlushTimer(streamBuffer) {
+  if (!streamBuffer?.timer) {
+    return;
+  }
+  clearTimeout(streamBuffer.timer);
+  streamBuffer.timer = null;
+}
+
+export function pruneHistory(history) {
+  const items = Array.isArray(history) ? history : [];
+  let nextItems = items;
+  let wasPruned = false;
+
+  if (nextItems.length > MAX_HISTORY_ITEMS) {
+    nextItems = nextItems.slice(-MAX_HISTORY_ITEMS);
+    wasPruned = true;
+  }
+
+  let totalChars = nextItems.reduce((sum, item) => sum + String(item?.text || "").length, 0);
+  let startIndex = 0;
+  while (totalChars > MAX_TOTAL_HISTORY_CHARS && startIndex < nextItems.length - 1) {
+    totalChars -= String(nextItems[startIndex]?.text || "").length;
+    startIndex += 1;
+    wasPruned = true;
+  }
+
+  if (startIndex > 0) {
+    nextItems = nextItems.slice(startIndex);
+  }
+
+  return {
+    items: nextItems,
+    wasPruned
+  };
+}
+
+export function sliceByVisibleWidth(text, width) {
   const limit = Math.max(1, width || 0);
   let visible = 0;
-  let result = "";
+  const chars = [];
 
-  for (const char of Array.from(String(text || ""))) {
+  for (const char of String(text || "")) {
     const nextWidth = getVisibleWidth(char);
-    if (visible + nextWidth > limit && result) {
+    if (visible + nextWidth > limit && chars.length) {
       break;
     }
-    result += char;
+    chars.push(char);
     visible += nextWidth;
     if (visible >= limit) {
       break;
     }
   }
 
-  return result;
+  return chars.join("");
 }
 
 function createHistoryItem(role, text, options = {}) {

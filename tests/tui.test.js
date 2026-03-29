@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import stringWidth from "string-width";
 import {
   buildFatalTuiDiagnostic,
+  buildTranscriptLines,
   buildContextUsageLines,
   buildAnimatedUsageFrame,
   detectRenderProfile,
@@ -19,7 +20,9 @@ import {
   loadPlotSnapshot,
   loadProjectSnapshot,
   hasUsageDelta,
+  pruneHistory,
   runEventHandlerSafely,
+  sliceByVisibleWidth,
   toggleInspectorView
 } from "../src/lib/tui.js";
 
@@ -370,6 +373,139 @@ test("getTranscriptWindow trims trailing blank transcript lines", () => {
 
   assert.equal(window.totalLines, 1);
   assert.equal(window.lines[0].line, "ai > 第一段");
+});
+
+test("getTranscriptWindow shows a truncation notice when history was pruned upstream", () => {
+  const history = [{ role: "assistant", text: "最近消息", streaming: false }];
+  const window = getTranscriptWindow(history, 40, 4, 9999, { historyWasPruned: true });
+
+  assert.equal(window.totalLines, 2);
+  assert.equal(window.hiddenAbove, 0);
+  assert.equal(window.lines[0].line, "sys> 更早消息已截断，以保持终端流畅。");
+  assert.equal(window.lines[1].line, "ai > 最近消息");
+});
+
+test("getTranscriptWindow caps transcript history and keeps the newest content", () => {
+  const history = Array.from({ length: 450 }, (_, index) => ({
+    role: index % 2 === 0 ? "assistant" : "event",
+    text: `line ${index + 1}`,
+    streaming: false
+  }));
+
+  const latest = getTranscriptWindow(history, 80, 4, 0);
+  assert.equal(latest.totalLines, 200);
+  assert.equal(latest.hiddenAbove, 196);
+  assert.match(latest.lines.at(-1).line, /line 450/);
+
+  const oldest = getTranscriptWindow(history, 80, 5, 9999);
+  assert.equal(oldest.scrollOffset, 195);
+  assert.equal(oldest.hiddenAbove, 0);
+  assert.equal(oldest.hiddenBelow, 195);
+  assert.equal(oldest.lines[0].line, "sys> 更早消息已截断，以保持终端流畅。");
+});
+
+test("getTranscriptWindow truncates oversized single-message transcripts by rendered lines", () => {
+  const history = [
+    {
+      role: "assistant",
+      text: Array.from({ length: 450 }, (_, index) => `片段${index + 1}`).join("\n"),
+      streaming: false
+    }
+  ];
+
+  const latest = getTranscriptWindow(history, 40, 3, 0);
+  assert.equal(latest.totalLines, 200);
+  assert.match(latest.lines.at(-1).line, /片段450/);
+
+  const oldest = getTranscriptWindow(history, 40, 3, 9999);
+  assert.equal(oldest.hiddenAbove, 0);
+  assert.equal(oldest.hiddenBelow, 197);
+  assert.match(oldest.lines[0].line, /更早消息已截断/);
+});
+
+test("buildTranscriptLines reuses cached wraps for completed transcript items", () => {
+  const wrapCache = new Map();
+  const history = [
+    {
+      id: "assistant-1",
+      role: "assistant",
+      text: "缓存命中测试缓存命中测试",
+      streaming: false
+    }
+  ];
+
+  const first = buildTranscriptLines(history, 10, { wrapCache });
+  assert.equal(wrapCache.size, 1);
+
+  const cached = wrapCache.values().next().value;
+  const second = buildTranscriptLines(history, 10, { wrapCache });
+
+  assert.equal(wrapCache.size, 1);
+  assert.strictEqual(first[0], cached[0]);
+  assert.strictEqual(second[0], cached[0]);
+});
+
+test("buildTranscriptLines incrementally extends cached wraps for streaming transcript items", () => {
+  const streamingWrapCache = new Map();
+  const firstHistory = [
+    {
+      id: "assistant-stream",
+      role: "assistant",
+      text: "abcdefghijkl",
+      streaming: true
+    }
+  ];
+  const secondHistory = [
+    {
+      id: "assistant-stream",
+      role: "assistant",
+      text: "abcdefghijklmnop",
+      streaming: true
+    }
+  ];
+
+  const first = buildTranscriptLines(firstHistory, 10, { streamingWrapCache });
+  const cached = streamingWrapCache.get("assistant-stream:assistant:10");
+  const second = buildTranscriptLines(secondHistory, 10, { streamingWrapCache });
+
+  assert.ok(cached);
+  assert.equal(first[0].line, "ai > abcde");
+  assert.equal(first[1].line, "fghijkl");
+  assert.equal(second[0].line, "ai > abcde");
+  assert.equal(second[1].line, "fghijklmno");
+  assert.equal(second[2].line, "p");
+  assert.equal(streamingWrapCache.get("assistant-stream:assistant:10").text, "ai > abcdefghijklmnop");
+});
+
+test("pruneHistory keeps the newest entries within item and character budgets", () => {
+  const byCount = pruneHistory(
+    Array.from({ length: 45 }, (_, index) => ({
+      id: `item-${index + 1}`,
+      text: `line ${index + 1}`
+    }))
+  );
+  assert.equal(byCount.wasPruned, true);
+  assert.equal(byCount.items.length, 40);
+  assert.equal(byCount.items[0].id, "item-6");
+
+  const byChars = pruneHistory([
+    { id: "old", text: "a".repeat(50000) },
+    { id: "mid", text: "b".repeat(50000) },
+    { id: "new", text: "c".repeat(50000) }
+  ]);
+  assert.equal(byChars.wasPruned, true);
+  assert.deepEqual(
+    byChars.items.map((item) => item.id),
+    ["mid", "new"]
+  );
+});
+
+test("sliceByVisibleWidth respects mixed-width characters without quadratic concatenation semantics", () => {
+  assert.equal(sliceByVisibleWidth("abcdef", 3), "abc");
+
+  const mixed = sliceByVisibleWidth("对齐修复abc继续观察", 8);
+  assert.ok(stringWidth(mixed) <= 8);
+  assert.equal(mixed, "对齐修复");
 });
 
 test("loadProjectSnapshot falls back safely when project refresh fails", async () => {
