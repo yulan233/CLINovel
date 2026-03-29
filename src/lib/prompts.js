@@ -18,15 +18,15 @@ export function buildOutlinePrompt(config, styleText, requirements = "") {
     "- 世界规则要强调约束、代价、隐藏规则。",
     "",
     "项目信息：",
-    `- 标题：${config.title || "未命名小说"}`,
-    `- 类型：${config.genre || "未定义"}`,
-    `- 目标篇幅：${config.target_length || "长篇"}`,
+    `- 标题：${safePromptInline(config.title, "未命名小说")}`,
+    `- 类型：${safePromptInline(config.genre, "未定义")}`,
+    `- 目标篇幅：${safePromptInline(config.target_length, "长篇")}`,
     "",
     "用户补充要求：",
-    requirements.trim() || "无",
+    safePromptBlock(requirements, "无"),
     "",
     "文风配置：",
-    formatStyleForPrompt(styleText)
+    safePromptBlock(formatStyleForPrompt(styleText), "无")
   ].join("\n");
 }
 
@@ -50,25 +50,25 @@ export function buildGuidedOutlinePrompt(config, guideAnswers, styleText) {
     "- 必须优先吸收用户已经明确指定的设定和冲突，不要擅自偏题。",
     "",
     "项目信息：",
-    `- 标题：${config.title || "未命名小说"}`,
-    `- 类型：${config.genre || "未定义"}`,
-    `- 目标篇幅：${config.target_length || "长篇"}`,
+    `- 标题：${safePromptInline(config.title, "未命名小说")}`,
+    `- 类型：${safePromptInline(config.genre, "未定义")}`,
+    `- 目标篇幅：${safePromptInline(config.target_length, "长篇")}`,
     "",
     "引导式输入：",
-    `- 题材与基调：${answers.genreAndTone}`,
-    `- 世界观与规则：${answers.worldAndRules}`,
-    `- 主角与初始处境：${answers.protagonistAndSetup}`,
-    `- 主线目标与代价：${answers.goalAndCost}`,
-    `- 冲突卖点与结局倾向：${answers.conflictAndEnding}`,
+    `- 题材与基调：${safePromptInline(answers.genreAndTone, "未指定")}`,
+    `- 世界观与规则：${safePromptInline(answers.worldAndRules, "未指定")}`,
+    `- 主角与初始处境：${safePromptInline(answers.protagonistAndSetup, "未指定")}`,
+    `- 主线目标与代价：${safePromptInline(answers.goalAndCost, "未指定")}`,
+    `- 冲突卖点与结局倾向：${safePromptInline(answers.conflictAndEnding, "未指定")}`,
     "",
     "文风配置：",
-    formatStyleForPrompt(styleText)
+    safePromptBlock(formatStyleForPrompt(styleText), "无")
   ].join("\n");
 }
 
 export function buildChapterPlanPrompt(chapterId, context) {
   return [
-    `你是中文小说章节策划助手，请为第${chapterId}章生成章节计划。`,
+    `你是中文小说章节策划助手，请为第${safePromptInline(chapterId, "000")}章生成章节计划。`,
     "请先输出 frontmatter，再输出 Markdown 正文。",
     "frontmatter 必须包含：chapter_id, goal, must_include, continuity_notes。",
     "正文必须包含：本章目标、冲突、场景拆分、关键转折、章末钩子。",
@@ -85,14 +85,14 @@ export function buildChapterPlanPrompt(chapterId, context) {
     "- must_include 必须具体到动作、冲突、线索、钩子，不要写泛泛而谈的词。",
     "",
     "写作上下文：",
-    context.trim()
+    safePromptBlock(context, "(无上下文)")
   ].join("\n");
 }
 
 export function buildPlotOptionsPrompt({ scope, chapterId, activeIntent, context }) {
   return [
     "你是中文小说剧情策划助手。",
-    `请围绕${scope === "book" ? "全书后续主线" : `第${String(chapterId).padStart(3, "0")}章及其后续`}生成 3 条互相区分明显的剧情走向。`,
+    `请围绕${scope === "book" ? "全书后续主线" : `第${safePromptInline(String(chapterId).padStart(3, "0"), "000")}章及其后续`}生成 3 条互相区分明显的剧情走向。`,
     "请严格输出 3 个区块：",
     "<option_1>...</option_1>",
     "<option_2>...</option_2>",
@@ -104,17 +104,17 @@ export function buildPlotOptionsPrompt({ scope, chapterId, activeIntent, context
     "不要输出任何额外解释。",
     "",
     "当前写作上下文：",
-    (context || "暂无额外上下文。").trim(),
+    safePromptBlock(context, "暂无额外上下文。"),
     "",
     activeIntent
-      ? `当前已采纳剧情意图：${activeIntent.title || ""} ${activeIntent.summary || ""}`.trim()
+      ? `当前已采纳剧情意图：${safePromptInline(`${activeIntent.title || ""} ${activeIntent.summary || ""}`.trim(), "未命名")}`
       : "当前没有已采纳剧情意图。"
   ].join("\n");
 }
 
 export function buildDraftPrompt(chapterId, context) {
   return [
-    `你是中文网络小说写作助手，请生成第${chapterId}章正文。`,
+    `你是中文网络小说写作助手，请生成第${safePromptInline(chapterId, "000")}章正文。`,
     "请先输出 frontmatter，再输出 Markdown 正文。",
     "frontmatter 必须包含：chapter_id, status, summary_status。",
     "正文要求：",
@@ -133,13 +133,13 @@ export function buildDraftPrompt(chapterId, context) {
     "- 禁止输出任何创作说明、策略说明、标签说明或自我评注",
     "",
     "写作上下文：",
-    context.trim()
+    safePromptBlock(context, "(无上下文)")
   ].join("\n");
 }
 
 export function buildMemoryPrompt(chapterId, draftText, existingMemory) {
   return [
-    `你是小说长期记忆整理助手，请总结第${chapterId}章。`,
+    `你是小说长期记忆整理助手，请总结第${safePromptInline(chapterId, "000")}章。`,
     "请严格输出以下 8 个标签区块，每个区块内部只写 Markdown 列表：",
     "<recent_summary>...</recent_summary>",
     "<global_summary>...</global_summary>",
@@ -168,10 +168,10 @@ export function buildMemoryPrompt(chapterId, draftText, existingMemory) {
     "- 若同一事实有新旧两个版本，只保留最新版本；旧版本不再复述。",
     "",
     "已有长期记忆：",
-    existingMemory.trim(),
+    safePromptBlock(existingMemory, "(无已有长期记忆)"),
     "",
     "本章正文：",
-    draftText.trim()
+    safePromptBlock(draftText, "(无正文)")
   ].join("\n");
 }
 
@@ -186,19 +186,19 @@ export function buildOutlineRevisionPrompt(currentOutline, feedback, styleText) 
     "只输出修订后的 Markdown，不要解释。",
     "",
     "用户反馈：",
-    feedback.trim(),
+    safePromptBlock(feedback, "(无反馈)"),
     "",
     "文风：",
-    formatStyleForPrompt(styleText),
+    safePromptBlock(formatStyleForPrompt(styleText), "无"),
     "",
     "当前大纲：",
-    currentOutline.trim()
+    safePromptBlock(currentOutline, "(无当前大纲)")
   ].join("\n");
 }
 
 export function buildChapterRevisionPrompt(chapterId, planText, draftText, feedback, context) {
   return [
-    `你是中文小说编辑，请根据反馈修订第${chapterId}章内容。`,
+    `你是中文小说编辑，请根据反馈修订第${safePromptInline(chapterId, "000")}章内容。`,
     "如果已提供正文，则输出修订后的正文；否则输出修订后的章节计划。",
     "请先输出 frontmatter，再输出 Markdown 正文。",
     "不要解释修改过程。",
@@ -207,22 +207,22 @@ export function buildChapterRevisionPrompt(chapterId, planText, draftText, feedb
     "如果反馈与既有上下文冲突，优先做最小破坏调整，不能直接推翻已成立事实。",
     "",
     "用户反馈：",
-    feedback.trim(),
+    safePromptBlock(feedback, "(无反馈)"),
     "",
     "当前章节计划：",
-    planText.trim() || "(无)",
+    safePromptBlock(planText, "(无)"),
     "",
     "当前章节正文：",
-    draftText.trim() || "(无)",
+    safePromptBlock(draftText, "(无)"),
     "",
     "写作上下文：",
-    context.trim()
+    safePromptBlock(context, "(无上下文)")
   ].join("\n");
 }
 
 export function buildChapterRewritePlanPrompt(chapterId, planText, draftText, feedback, context) {
   return [
-    `你是中文小说重写策划助手，请为第${chapterId}章生成“先检索、再重写”的工作计划。`,
+    `你是中文小说重写策划助手，请为第${safePromptInline(chapterId, "000")}章生成“先检索、再重写”的工作计划。`,
     "请严格输出以下 3 个标签区块，不要输出额外解释：",
     "<retrieval_plan>...</retrieval_plan>",
     "<retrieval_items>...</retrieval_items>",
@@ -236,22 +236,22 @@ export function buildChapterRewritePlanPrompt(chapterId, planText, draftText, fe
     "- rewrite_focus：列出本次重写最需要修复的结构目标、节奏问题、伏笔承接、人物动机或信息顺序。",
     "",
     "当前反馈：",
-    feedback?.trim() || "(无额外反馈，默认以提升结构承接与上文一致性为目标)",
+    safePromptBlock(feedback, "(无额外反馈，默认以提升结构承接与上文一致性为目标)"),
     "",
     "当前章节计划：",
-    planText.trim() || "(无)",
+    safePromptBlock(planText, "(无)"),
     "",
     "当前章节正文：",
-    draftText.trim() || "(无)",
+    safePromptBlock(draftText, "(无)"),
     "",
     "当前写作上下文：",
-    context.trim()
+    safePromptBlock(context, "(无上下文)")
   ].join("\n");
 }
 
 export function buildChapterRewritePrompt(chapterId, planText, draftText, feedback, context, retrievalPlan, supplementalContext) {
   return [
-    `你是中文小说重写助手，请重写第${chapterId}章内容。`,
+    `你是中文小说重写助手，请重写第${safePromptInline(chapterId, "000")}章内容。`,
     "如果已提供正文，则输出重写后的正文；否则输出重写后的章节计划。",
     "请先输出 frontmatter，再输出 Markdown 正文。",
     "不要解释修改过程，不要输出标签。",
@@ -265,22 +265,22 @@ export function buildChapterRewritePrompt(chapterId, planText, draftText, feedba
     "- 禁止出现“以下是”“我将”“我认为”“作为AI”“这里是”“我会”“思考过程”等元叙述。",
     "",
     "用户补充要求：",
-    feedback?.trim() || "(无额外反馈，默认优化上文承接、结构推进和信息组织)",
+    safePromptBlock(feedback, "(无额外反馈，默认优化上文承接、结构推进和信息组织)"),
     "",
     "检索规划：",
-    retrievalPlan.trim() || "(无额外检索规划)",
+    safePromptBlock(retrievalPlan, "(无额外检索规划)"),
     "",
     "补充检索上下文：",
-    supplementalContext.trim() || "(无额外补充内容)",
+    safePromptBlock(supplementalContext, "(无额外补充内容)"),
     "",
     "当前章节计划：",
-    planText.trim() || "(无)",
+    safePromptBlock(planText, "(无)"),
     "",
     "当前章节正文：",
-    draftText.trim() || "(无)",
+    safePromptBlock(draftText, "(无)"),
     "",
     "全局写作上下文：",
-    context.trim()
+    safePromptBlock(context, "(无上下文)")
   ].join("\n");
 }
 
@@ -336,4 +336,24 @@ function normalizeGuideAnswers(guideAnswers = {}) {
     goalAndCost: String(guideAnswers.goalAndCost || "").trim() || "未指定",
     conflictAndEnding: String(guideAnswers.conflictAndEnding || "").trim() || "未指定"
   };
+}
+
+function safePromptInline(value, fallback = "") {
+  const normalized = escapePromptText(value).replace(/\s+/g, " ").trim();
+  return normalized || fallback;
+}
+
+function safePromptBlock(value, fallback = "") {
+  const normalized = escapePromptText(value).trim();
+  return normalized || fallback;
+}
+
+function escapePromptText(value) {
+  return String(value || "")
+    .normalize("NFC")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("\"", "&quot;")
+    .replaceAll("'", "&apos;");
 }

@@ -1,6 +1,7 @@
 import path from "node:path";
-import { ensureDir, exists, listFiles, readText, writeText } from "./fs.js";
+import { ensureDir, exists, safeListPath, safeReadPath, writeText } from "./fs.js";
 import { parseFrontmatter } from "./frontmatter.js";
+import { safeResolve } from "./path-safe.js";
 
 export const PROJECT_STRUCTURE = [
   "outline",
@@ -13,38 +14,40 @@ export const PROJECT_STRUCTURE = [
 ];
 
 export function resolveProjectPaths(rootDir = process.cwd()) {
+  const resolveWithinProject = (target) => safeResolve(rootDir, target);
   return {
     rootDir,
-    config: path.join(rootDir, "project.yaml"),
-    envExample: path.join(rootDir, ".env.example"),
-    gitignore: path.join(rootDir, ".gitignore"),
-    style: path.join(rootDir, "style.md"),
-    outlineStory: path.join(rootDir, "outline", "story.md"),
-    outlineArcs: path.join(rootDir, "outline", "arcs.md"),
-    characters: path.join(rootDir, "characters", "roster.md"),
-    world: path.join(rootDir, "world", "rules.md"),
-    recentSummary: path.join(rootDir, "memory", "recent_summary.md"),
-    globalSummary: path.join(rootDir, "memory", "global_summary.md"),
-    archiveSummary: path.join(rootDir, "memory", "archive_summary.md"),
-    plotOptions: path.join(rootDir, "memory", "plot_options.json"),
-    chapterIndex: path.join(rootDir, "memory", "chapter_index.json"),
-    storyThreads: path.join(rootDir, "memory", "story_threads.json"),
-    entities: path.join(rootDir, "memory", "entities.json"),
-    structuredLoops: path.join(rootDir, "memory", "open_loops.json"),
-    continuityWarnings: path.join(rootDir, "memory", "continuity_warnings.json"),
-    memoryChaptersDir: path.join(rootDir, "memory", "chapters"),
-    openLoops: path.join(rootDir, "memory", "open_loops.md"),
-    characterState: path.join(rootDir, "memory", "character_state.md"),
-    worldState: path.join(rootDir, "memory", "world_state.md"),
-    forgettingLog: path.join(rootDir, "memory", "forgetting_log.md")
+    config: resolveWithinProject("project.yaml"),
+    envExample: resolveWithinProject(".env.example"),
+    gitignore: resolveWithinProject(".gitignore"),
+    style: resolveWithinProject("style.md"),
+    outlineStory: resolveWithinProject("outline/story.md"),
+    outlineArcs: resolveWithinProject("outline/arcs.md"),
+    characters: resolveWithinProject("characters/roster.md"),
+    world: resolveWithinProject("world/rules.md"),
+    recentSummary: resolveWithinProject("memory/recent_summary.md"),
+    globalSummary: resolveWithinProject("memory/global_summary.md"),
+    archiveSummary: resolveWithinProject("memory/archive_summary.md"),
+    plotOptions: resolveWithinProject("memory/plot_options.json"),
+    chapterIndex: resolveWithinProject("memory/chapter_index.json"),
+    storyThreads: resolveWithinProject("memory/story_threads.json"),
+    entities: resolveWithinProject("memory/entities.json"),
+    structuredLoops: resolveWithinProject("memory/open_loops.json"),
+    continuityWarnings: resolveWithinProject("memory/continuity_warnings.json"),
+    memoryChaptersDir: resolveWithinProject("memory/chapters"),
+    openLoops: resolveWithinProject("memory/open_loops.md"),
+    characterState: resolveWithinProject("memory/character_state.md"),
+    worldState: resolveWithinProject("memory/world_state.md"),
+    forgettingLog: resolveWithinProject("memory/forgetting_log.md")
   };
 }
 
 export async function initProject(rootDir, name = path.basename(rootDir)) {
-  const paths = resolveProjectPaths(rootDir);
+  const normalizedRootDir = path.resolve(rootDir);
+  const paths = resolveProjectPaths(normalizedRootDir);
 
   for (const entry of PROJECT_STRUCTURE) {
-    await ensureDir(path.join(rootDir, entry));
+    await ensureDir(safeResolve(normalizedRootDir, entry));
   }
 
   const files = [
@@ -116,33 +119,17 @@ export async function initProject(rootDir, name = path.basename(rootDir)) {
 }
 
 export async function loadProjectConfig(rootDir = process.cwd()) {
-  const configPath = resolveProjectPaths(rootDir).config;
-  const raw = await readText(configPath);
+  const raw = await safeReadPath(rootDir, "project.yaml");
 
   if (!raw) {
     throw new Error("project.yaml not found. Run `ainovel init <name>` first.");
   }
 
-  const config = {};
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const separator = trimmed.indexOf(":");
-    if (separator === -1) {
-      continue;
-    }
-    const key = trimmed.slice(0, separator).trim();
-    const value = trimmed.slice(separator + 1).trim();
-    config[key] = value;
-  }
-  return config;
+  return parseProjectYaml(raw);
 }
 
 export async function getNextChapterId(rootDir = process.cwd()) {
-  const chapterDir = path.join(rootDir, "chapters");
-  const files = await listFiles(chapterDir);
+  const files = await safeListPath(rootDir, "chapters");
   let max = 0;
 
   for (const file of files) {
@@ -156,8 +143,7 @@ export async function getNextChapterId(rootDir = process.cwd()) {
 }
 
 export async function getChapterStatuses(rootDir = process.cwd()) {
-  const chapterDir = path.join(rootDir, "chapters");
-  const files = await listFiles(chapterDir);
+  const files = await safeListPath(rootDir, "chapters");
   const map = new Map();
 
   for (const file of files) {
@@ -178,7 +164,7 @@ export async function getChapterStatuses(rootDir = process.cwd()) {
     item.hasDraft = item.hasDraft || kind === "draft";
 
     if (kind === "draft") {
-      const raw = await readText(path.join(chapterDir, file), "");
+      const raw = await safeReadPath(rootDir, `chapters/${file}`, "");
       const parsed = parseFrontmatter(raw);
       item.summaryStatus = parsed.data.summary_status || "pending";
     }
@@ -194,8 +180,100 @@ export async function getChapterArtifacts(rootDir = process.cwd(), chapterId) {
   const paths = resolveProjectPaths(rootDir);
   return {
     chapterId: chapterSlug,
-    planPath: path.join(rootDir, "chapters", `${chapterSlug}.plan.md`),
-    draftPath: path.join(rootDir, "chapters", `${chapterSlug}.draft.md`),
-    memoryPath: path.join(paths.memoryChaptersDir, `${chapterSlug}.summary.md`)
+    planPath: safeResolve(rootDir, `chapters/${chapterSlug}.plan.md`),
+    draftPath: safeResolve(rootDir, `chapters/${chapterSlug}.draft.md`),
+    memoryPath: safeResolve(paths.memoryChaptersDir, `${chapterSlug}.summary.md`)
   };
+}
+
+function parseProjectYaml(raw) {
+  const lines = String(raw || "").replace(/\r\n/g, "\n").split("\n");
+  const config = {};
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || /^\s/.test(line)) {
+      continue;
+    }
+
+    const separator = line.indexOf(":");
+    if (separator === -1) {
+      continue;
+    }
+
+    const key = line.slice(0, separator).trim();
+    const value = line.slice(separator + 1).trim();
+    if (value) {
+      config[key] = parseYamlScalar(value);
+      continue;
+    }
+
+    const blockLines = [];
+    let cursor = index + 1;
+    while (cursor < lines.length) {
+      const blockLine = lines[cursor];
+      if (!blockLine.trim()) {
+        blockLines.push("");
+        cursor += 1;
+        continue;
+      }
+      if (!/^\s+/.test(blockLine)) {
+        break;
+      }
+      blockLines.push(blockLine);
+      cursor += 1;
+    }
+
+    config[key] = parseYamlBlock(blockLines);
+    index = cursor - 1;
+  }
+
+  return config;
+}
+
+function parseYamlBlock(lines) {
+  const nonEmpty = lines.filter((line) => line.trim());
+  if (nonEmpty.length === 0) {
+    return "";
+  }
+
+  if (nonEmpty.every((line) => line.trim().startsWith("- "))) {
+    return nonEmpty
+      .map((line) => parseYamlScalar(line.trim().slice(2).trim()))
+      .filter((item) => item !== "");
+  }
+
+  return lines
+    .map((line) => line.replace(/^\s+/, ""))
+    .join("\n")
+    .trimEnd();
+}
+
+function parseYamlScalar(value) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+    return trimmed
+      .slice(1, -1)
+      .split(",")
+      .map((item) => stripYamlQuotes(item.trim()))
+      .filter(Boolean);
+  }
+
+  return stripYamlQuotes(trimmed);
+}
+
+function stripYamlQuotes(value) {
+  if (
+    (value.startsWith('"') && value.endsWith('"')) ||
+    (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+
+  return value;
 }

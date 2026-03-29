@@ -1,20 +1,27 @@
 import path from "node:path";
-import { exists, readText } from "./fs.js";
+import { exists, safeReadPath } from "./fs.js";
+import { safeResolve } from "./path-safe.js";
 
 export async function loadEnv(rootDir = process.cwd()) {
   const candidates = [
-    path.join(rootDir, ".env"),
-    path.join(process.cwd(), ".env")
+    safeResolve(rootDir, ".env"),
+    safeResolve(process.cwd(), ".env")
   ];
+  const loadedFiles = [];
 
   for (const filePath of [...new Set(candidates)]) {
     if (!(await exists(filePath))) {
       continue;
     }
 
-    const raw = await readText(filePath, "");
+    const raw = await safeReadPath(path.dirname(filePath), path.basename(filePath), "");
     applyEnvText(raw);
+    loadedFiles.push(filePath);
   }
+
+  return {
+    loadedFiles
+  };
 }
 
 export function applyEnvText(raw) {

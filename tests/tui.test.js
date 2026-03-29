@@ -19,6 +19,7 @@ import {
   loadPlotSnapshot,
   loadProjectSnapshot,
   hasUsageDelta,
+  runEventHandlerSafely,
   toggleInspectorView
 } from "../src/lib/tui.js";
 
@@ -45,6 +46,23 @@ test("buildSummaryLines prioritizes focus, task, and latest result", () => {
   assert.match(lines[0], /plan yes/);
   assert.match(lines[1], /task chapter-plan/);
   assert.match(lines[2], /Generated chapter plan/);
+});
+
+test("runEventHandlerSafely catches handler exceptions and forwards them", () => {
+  let captured = null;
+  const result = runEventHandlerSafely(
+    { type: "artifact_written" },
+    () => {
+      throw new Error("boom");
+    },
+    (error, event) => {
+      captured = { error, event };
+    }
+  );
+
+  assert.equal(result, false);
+  assert.equal(captured.error.message, "boom");
+  assert.equal(captured.event.type, "artifact_written");
 });
 
 test("buildInspectorLines renders status and artifacts views", () => {

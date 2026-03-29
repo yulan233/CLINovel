@@ -30,3 +30,10 @@ test("buildTokenUsage falls back for unknown models", () => {
   const usage = buildTokenUsage([{ id: "style", label: "文风", text: "冷峻、克制。", group: "prompt" }], 2000, "custom-model");
   assert.ok(usage.usedTokens > 0);
 });
+
+test("countTokens normalizes unicode before encoding", () => {
+  const composed = "é";
+  const decomposed = "e\u0301";
+
+  assert.equal(countTokens(composed, "gpt-4.1-mini"), countTokens(decomposed, "gpt-4.1-mini"));
+});

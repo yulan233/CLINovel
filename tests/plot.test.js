@@ -55,3 +55,35 @@ test("plot thread status transitions remove resolved thread from intent context"
   const intentContext = await buildIntentContext(root, "005");
   assert.equal(intentContext, "");
 });
+
+test("reapplying a plot option updates the persisted active intent", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-plot-reapply-"));
+  await initProject(root, "plot-reapply-demo");
+
+  const generated = await generatePlotOptions(root, "chapter", "002", {});
+  const first = generated.options[0];
+  const second = generated.options[1];
+
+  await changePlotOptionStatus(root, first.id, "applied");
+  const secondApplied = await changePlotOptionStatus(root, second.id, "applied");
+
+  const saved = await loadPlotState(root);
+  assert.equal(saved.activeIntent.plotOptionId, second.id);
+  assert.equal(saved.activeIntent.threadId, secondApplied.thread.id);
+});
+
+test("dropping an applied option clears stale activeIntent option references", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-plot-drop-"));
+  await initProject(root, "plot-drop-demo");
+
+  const generated = await generatePlotOptions(root, "chapter", "002", {});
+  const first = generated.options[0];
+  const second = generated.options[1];
+
+  await changePlotOptionStatus(root, first.id, "applied");
+  await changePlotOptionStatus(root, second.id, "applied");
+  await changePlotOptionStatus(root, second.id, "dropped");
+
+  const saved = await loadPlotState(root);
+  assert.notEqual(saved.activeIntent?.plotOptionId, second.id);
+});

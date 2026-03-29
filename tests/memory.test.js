@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { getChapterTags, rebuildMemory, rebuildMemoryAggregates, searchMemory } from "../src/lib/memory.js";
+import { buildAssembledContext, getChapterTags, rebuildMemory, rebuildMemoryAggregates, searchMemory } from "../src/lib/memory.js";
 import { initProject, resolveProjectPaths } from "../src/lib/project.js";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
@@ -248,4 +248,87 @@ test("chapter index supports tag and entity search", async () => {
   assert.ok(tags.includes("clue"));
   assert.equal(byTag[0].chapterId, "001");
   assert.equal(byEntity[0].chapterId, "001");
+});
+
+test("searchMemory does not treat single-character thread queries as broad substrings", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-memory-thread-search-"));
+  const paths = await initProject(root, "memory-thread-demo");
+
+  await writeText(
+    path.join(paths.memoryChaptersDir, "001.summary.md"),
+    [
+      "# 第001章记忆摘要",
+      "",
+      "## 章节摘要",
+      "- 可爱危机升级。",
+      "",
+      "## 长期摘要",
+      "- 主线：可爱危机升级。",
+      "",
+      "## 未回收伏笔",
+      "- 危机尚未解除。",
+      "",
+      "## 人物状态",
+      "- 主角：决定继续追查。",
+      "",
+      "## 世界状态",
+      "- 王城：风声趋紧。",
+      ""
+    ].join("\n")
+  );
+
+  await rebuildMemoryAggregates(root);
+
+  const broad = await searchMemory(root, { thread: "爱" });
+  const exact = await searchMemory(root, { thread: "可爱" });
+
+  assert.equal(broad.length, 0);
+  assert.equal(exact[0].chapterId, "001");
+});
+
+test("buildAssembledContext enforces the final token budget", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-context-budget-"));
+  const paths = await initProject(root, "context-budget-demo");
+
+  await writeText(
+    paths.config,
+    [
+      "title: demo",
+      "genre: 玄幻",
+      "target_length: 长篇",
+      "default_model: gpt-4.1-mini",
+      "context_budget: 120",
+      "summary_policy: chapter+rolling"
+    ].join("\n") + "\n"
+  );
+  await writeText(path.join(root, "chapters", "001.plan.md"), "---\nchapter_id: 001\n---\n" + "计划推进。".repeat(120));
+  await writeText(paths.recentSummary, "# 近期剧情摘要\n\n" + "近期推进。".repeat(120));
+  await writeText(paths.characterState, "# 人物状态\n\n- 主角：" + "状态变化，".repeat(120) + "\n");
+  await writeText(paths.worldState, "# 世界状态\n\n- 王城：" + "封锁升级，".repeat(120) + "\n");
+
+  const assembled = await buildAssembledContext(root, "001", { budget: 120 });
+
+  assert.ok(assembled.usage.usedTokens <= 120);
+  assert.ok(assembled.usage.truncatedSections.length > 0 || assembled.usage.excludedSections.length > 0);
+});
+
+test("rebuildMemory skips empty draft files and reports warnings", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "ainovel-memory-warning-"));
+  const paths = await initProject(root, "memory-warning-demo");
+
+  await writeText(
+    path.join(root, "chapters", "001.draft.md"),
+    stringifyFrontmatter(
+      { chapter_id: "001", status: "draft", summary_status: "pending" },
+      "# 第001章\n\n剧情推进。"
+    )
+  );
+  await writeText(path.join(root, "chapters", "002.draft.md"), "");
+
+  const result = await rebuildMemory(root);
+  const summary001 = await readText(path.join(paths.memoryChaptersDir, "001.summary.md"));
+
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].chapterId, "002");
+  assert.match(summary001, /第001章记忆摘要/);
 });

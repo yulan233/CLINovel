@@ -1,5 +1,6 @@
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { safeResolve } from "./path-safe.js";
 
 export async function ensureDir(dirPath) {
   await mkdir(dirPath, { recursive: true });
@@ -50,4 +51,18 @@ export async function listFiles(dirPath, suffix = ".md") {
 
 export async function removeDir(targetPath) {
   await rm(targetPath, { recursive: true, force: true });
+}
+
+export async function safeReadPath(baseDir, target, fallback = "") {
+  return readText(safeResolve(baseDir, target), fallback);
+}
+
+export async function safeWritePath(baseDir, target, content) {
+  const filePath = safeResolve(baseDir, target);
+  await writeText(filePath, content);
+  return filePath;
+}
+
+export async function safeListPath(baseDir, target = ".", suffix = ".md") {
+  return listFiles(safeResolve(baseDir, target), suffix);
 }

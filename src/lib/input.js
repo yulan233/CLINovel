@@ -172,6 +172,10 @@ export function getSlashSuggestions(input, state = { currentChapterId: null }) {
 }
 
 function parseSlashCommand(input, state) {
+  if (!String(input || "").startsWith("/")) {
+    throw new Error("Slash commands must start with /.");
+  }
+
   const [command, ...rest] = input.slice(1).split(/\s+/);
   const arg = rest.join(" ").trim();
 
@@ -301,6 +305,9 @@ function parseReviseSlash(arg, state) {
   const hasChapter = /^\d+$/.test(parts[0] || "");
   const chapterId = hasChapter ? parts[0] : state.currentChapterId;
   const feedback = hasChapter ? parts.slice(1).join(" ") : parts.join(" ");
+  if (!String(feedback || "").trim()) {
+    throw new Error("Usage: /revise [chapter] <feedback>");
+  }
   return ["chapter", "revise", chapterId, feedback];
 }
 

@@ -1,11 +1,19 @@
+import { getModelContextWindow } from "./token.js";
+
 const DEFAULT_MODEL = process.env.AINOVEL_MODEL || "fallback-local";
 const DEFAULT_BASE_URL = process.env.AINOVEL_BASE_URL || "https://api.openai.com/v1";
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_RETRY_DELAY_MS = 400;
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 export function getLlmConfig(projectConfig = {}) {
   return {
     model: process.env.AINOVEL_MODEL || projectConfig.default_model || DEFAULT_MODEL,
     apiKey: process.env.AINOVEL_API_KEY || "",
-    baseUrl: process.env.AINOVEL_BASE_URL || DEFAULT_BASE_URL
+    baseUrl: process.env.AINOVEL_BASE_URL || DEFAULT_BASE_URL,
+    timeoutMs: readPositiveInt(process.env.AINOVEL_REQUEST_TIMEOUT_MS || projectConfig.request_timeout_ms, DEFAULT_REQUEST_TIMEOUT_MS)
   };
 }
 
@@ -15,6 +23,7 @@ export function describeLlmMode(projectConfig = {}) {
 
   return {
     ...config,
+    contextWindow: getModelContextWindow(config.model),
     remoteEnabled,
     maskedApiKey: config.apiKey ? `${config.apiKey.slice(0, 4)}***` : "(not set)"
   };
@@ -30,40 +39,22 @@ export async function generateText(task, prompt, projectConfig = {}, options = {
     return null;
   }
 
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${config.apiKey}`
-    },
-    body: JSON.stringify({
-      model: config.model,
-      temperature: task === "draft" ? 0.9 : 0.5,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an AI novelist assistant. Return clean markdown only. Stay consistent with prior plot facts."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ]
-    })
+  return executeChatCompletionRequest(task, prompt, config, options, async (response) => {
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      const body = await response.text();
+      throw new Error(`LLM returned invalid JSON for task "${task}": ${body}`);
+    }
+
+    const text = payload?.choices?.[0]?.message?.content?.trim();
+    if (!text) {
+      throw new Error(`LLM returned empty content for task "${task}"`);
+    }
+
+    return text;
   });
-
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`LLM request failed (${response.status}): ${body}`);
-  }
-
-  const payload = await response.json();
-  const text = payload?.choices?.[0]?.message?.content?.trim();
-  if (!text) {
-    throw new Error(`LLM returned empty content for task "${task}"`);
-  }
-  return text;
 }
 
 export async function streamText(task, prompt, projectConfig = {}, observer = {}) {
@@ -85,87 +76,297 @@ export async function streamText(task, prompt, projectConfig = {}, observer = {}
     return streamed;
   }
 
-  const response = await fetch(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${config.apiKey}`
-    },
-    signal,
-    body: JSON.stringify({
-      model: config.model,
-      temperature: task === "draft" ? 0.9 : 0.5,
-      stream: true,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are an AI novelist assistant. Return clean markdown only. Stay consistent with prior plot facts."
-        },
-        {
-          role: "user",
-          content: prompt
+  return executeChatCompletionRequest(task, prompt, config, { ...observer, stream: true }, async (response, request) => {
+    if (!response.body) {
+      throw new Error("LLM response did not include a stream body");
+    }
+
+    let reader;
+    try {
+      reader = response.body.getReader();
+    } catch (error) {
+      throw new Error(`Failed to open LLM response stream: ${error.message}`);
+    }
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let text = "";
+
+    try {
+      while (true) {
+        if (signal?.aborted) {
+          throw abortError();
         }
-      ]
-    })
-  });
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`LLM request failed (${response.status}): ${body}`);
-  }
+        const { value, done } = await readStreamChunkWithTimeout(
+          reader,
+          readPositiveInt(observer.streamChunkTimeoutMs, DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+          request
+        );
+        if (done) {
+          break;
+        }
 
-  if (!response.body) {
-    throw new Error("LLM response did not include a stream body");
-  }
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n\n");
+        buffer = chunks.pop() || "";
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let text = "";
+        for (const chunk of chunks) {
+          const parsed = parseSseChunk(chunk);
+          for (const entry of parsed) {
+            if (entry === "[DONE]") {
+              onComplete(text);
+              return text;
+            }
 
-  while (true) {
-    if (signal?.aborted) {
-      throw abortError();
+            try {
+              const payload = JSON.parse(entry);
+              const delta = payload?.choices?.[0]?.delta?.content || "";
+              if (delta) {
+                text += delta;
+                onToken(delta, text);
+              }
+            } catch {
+              // Ignore unknown stream frames from compatible providers.
+            }
+          }
+        }
+      }
+    } catch (error) {
+      if (text.trim()) {
+        error.retryable = false;
+      }
+      throw error;
+    } finally {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore stream close errors during cleanup.
+      }
     }
 
-    const { value, done } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() || "";
-
-    for (const chunk of chunks) {
-      const parsed = parseSseChunk(chunk);
-      for (const entry of parsed) {
+    if (buffer.trim()) {
+      const trailing = parseSseChunk(buffer);
+      for (const entry of trailing) {
         if (entry === "[DONE]") {
           onComplete(text);
           return text;
         }
-
-        try {
-          const payload = JSON.parse(entry);
-          const delta = payload?.choices?.[0]?.delta?.content || "";
-          if (delta) {
-            text += delta;
-            onToken(delta, text);
-          }
-        } catch {
-          // Ignore unknown stream frames from compatible providers.
-        }
       }
+    }
+
+    if (!text.trim()) {
+      throw new Error(`LLM returned empty content for task "${task}"`);
+    }
+
+    onComplete(text);
+    return text;
+  });
+}
+
+async function executeChatCompletionRequest(task, prompt, config, options, consumeResponse) {
+  const url = `${config.baseUrl.replace(/\/$/, "")}/chat/completions`;
+  const timeoutMs = readPositiveInt(options.timeoutMs, config.timeoutMs || DEFAULT_REQUEST_TIMEOUT_MS);
+  const maxRetries = readPositiveInt(options.maxRetries, DEFAULT_MAX_RETRIES);
+  const retryDelayMs = readPositiveInt(options.retryDelayMs, DEFAULT_RETRY_DELAY_MS);
+  let attempt = 0;
+
+  while (true) {
+    attempt += 1;
+    const request = createRequestContext(options.signal, timeoutMs);
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${config.apiKey}`
+        },
+        signal: request.signal,
+        body: JSON.stringify(buildChatRequest(task, prompt, config.model, options.stream === true))
+      });
+
+      if (!response.ok) {
+        if (attempt <= maxRetries && shouldRetryStatus(response.status)) {
+          await waitBeforeRetry(attempt, response.headers.get("retry-after"), retryDelayMs, options.signal);
+          continue;
+        }
+        throw await buildHttpError(response);
+      }
+
+      return await consumeResponse(response, request);
+    } catch (error) {
+      const normalized = normalizeRequestError(error, request.signal, options.signal);
+      if (normalized.name === "AbortError" && !isTimeoutError(normalized)) {
+        throw normalized;
+      }
+      if (attempt > maxRetries || !shouldRetryError(normalized)) {
+        throw normalized;
+      }
+      await waitBeforeRetry(attempt, null, retryDelayMs, options.signal);
+    } finally {
+      request.cleanup();
+    }
+  }
+}
+
+function buildChatRequest(task, prompt, model, stream) {
+  return {
+    model: model === "fallback-local" ? "gpt-4o-mini" : model,
+    stream,
+    temperature: task === "draft" ? 0.9 : 0.5,
+    messages: [
+      {
+        role: "system",
+        content:
+          "You are an AI novelist assistant. Return clean markdown only. Stay consistent with prior plot facts."
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ]
+  };
+}
+
+async function buildHttpError(response) {
+  const body = await response.text();
+  return new Error(`LLM request failed (${response.status}): ${body}`);
+}
+
+async function readStreamChunkWithTimeout(reader, idleTimeoutMs, request) {
+  if (!idleTimeoutMs) {
+    return reader.read();
+  }
+
+  let timeoutId = null;
+  const stalledError = timeoutError(`LLM stream stalled for ${idleTimeoutMs}ms`);
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      request.abort(stalledError);
+      Promise.resolve(reader.cancel(stalledError)).catch(() => {});
+      reject(stalledError);
+    }, idleTimeoutMs);
+    timeoutId.unref?.();
+  });
+
+  return Promise.race([reader.read(), timeoutPromise]).finally(() => {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  });
+}
+
+function createRequestContext(externalSignal, timeoutMs) {
+  const controller = new AbortController();
+  const cleanupFns = [];
+  let timeoutId = null;
+
+  const abort = (reason) => {
+    if (!controller.signal.aborted) {
+      controller.abort(reason);
+    }
+  };
+
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      abort(normalizeAbortReason(externalSignal.reason));
+    } else {
+      const onAbort = () => abort(normalizeAbortReason(externalSignal.reason));
+      externalSignal.addEventListener("abort", onAbort, { once: true });
+      cleanupFns.push(() => externalSignal.removeEventListener("abort", onAbort));
     }
   }
 
-  if (!text.trim()) {
-    throw new Error(`LLM returned empty content for task "${task}"`);
+  if (timeoutMs > 0) {
+    const reason = timeoutError(`LLM request timed out after ${timeoutMs}ms`);
+    timeoutId = setTimeout(() => abort(reason), timeoutMs);
+    timeoutId.unref?.();
   }
 
-  onComplete(text);
-  return text;
+  return {
+    signal: controller.signal,
+    abort,
+    cleanup() {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      for (const fn of cleanupFns) {
+        fn();
+      }
+    }
+  };
+}
+
+function normalizeRequestError(error, requestSignal, externalSignal) {
+  if (externalSignal?.aborted) {
+    return abortError();
+  }
+
+  if (requestSignal?.aborted) {
+    return normalizeAbortReason(requestSignal.reason);
+  }
+
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function normalizeAbortReason(reason) {
+  if (reason instanceof Error) {
+    return reason;
+  }
+
+  return abortError();
+}
+
+function shouldRetryStatus(status) {
+  return RETRYABLE_STATUS_CODES.has(Number(status));
+}
+
+function shouldRetryError(error) {
+  if (error?.retryable === false) {
+    return false;
+  }
+
+  if (isTimeoutError(error)) {
+    return true;
+  }
+
+  if (error?.name === "AbortError") {
+    return false;
+  }
+
+  if (error?.name === "TypeError") {
+    return true;
+  }
+
+  const causeCode = error?.cause?.code || error?.code;
+  return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "UND_ERR_CONNECT_TIMEOUT"].includes(causeCode);
+}
+
+async function waitBeforeRetry(attempt, retryAfterHeader, retryDelayMs, signal) {
+  const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
+  const backoffMs = retryAfterMs ?? Math.min(8_000, retryDelayMs * (2 ** Math.max(0, attempt - 1)));
+  if (backoffMs > 0) {
+    await delay(backoffMs, signal);
+  }
+}
+
+function parseRetryAfterMs(headerValue) {
+  if (!headerValue) {
+    return null;
+  }
+
+  const seconds = Number.parseFloat(headerValue);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, Math.round(seconds * 1000));
+  }
+
+  const timestamp = Date.parse(headerValue);
+  if (Number.isNaN(timestamp)) {
+    return null;
+  }
+
+  return Math.max(0, timestamp - Date.now());
 }
 
 async function streamFallbackText(text, { onToken, signal }) {
@@ -180,7 +381,7 @@ async function streamFallbackText(text, { onToken, signal }) {
       output += chunk;
       onToken(chunk, output);
     }
-    await delay(12);
+    await delay(12, signal);
   }
 
   return output;
@@ -207,12 +408,51 @@ function chunkText(text, size) {
   return chunks;
 }
 
-function delay(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delay(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortError());
+      return;
+    }
+
+    function onAbort() {
+      clearTimeout(timer);
+      reject(abortError());
+    }
+
+    const timer = setTimeout(() => {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
+      resolve();
+    }, ms);
+    timer.unref?.();
+
+    if (!signal) {
+      return;
+    }
+
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function abortError() {
   const error = new Error("Generation aborted");
   error.name = "AbortError";
   return error;
+}
+
+function timeoutError(message) {
+  const error = new Error(message);
+  error.name = "TimeoutError";
+  return error;
+}
+
+function isTimeoutError(error) {
+  return error?.name === "TimeoutError";
+}
+
+function readPositiveInt(value, fallback) {
+  const parsed = Number.parseInt(String(value ?? ""), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }

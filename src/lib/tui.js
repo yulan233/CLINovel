@@ -1,5 +1,5 @@
 import process from "node:process";
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { render, Box, Text, useApp, useInput } from "ink";
 import Spinner from "ink-spinner";
 import TextInput from "ink-text-input";
@@ -8,7 +8,8 @@ import { readText } from "./fs.js";
 import { logError } from "./log.js";
 import { getSlashSuggestions, interpretInput, updateInputState } from "./input.js";
 import { describeLlmMode } from "./llm.js";
-import { buildContextSections, loadStructuredMemory } from "./memory.js";
+import { buildContextSections } from "./memory/context.js";
+import { loadStructuredMemory } from "./memory/search.js";
 import { buildIntentContext, loadPlotState } from "./plot.js";
 import { loadProjectConfig, getChapterStatuses, resolveProjectPaths } from "./project.js";
 import { buildTokenUsage } from "./token.js";
@@ -129,26 +130,44 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
       streaming: false
     }
   ]);
-  const [currentChapterId, setCurrentChapterId] = useState(null);
-  const [activeTask, setActiveTask] = useState(null);
-  const [taskPhase, setTaskPhase] = useState("idle");
-  const [lastResult, setLastResult] = useState("Ready.");
-  const [lastArtifacts, setLastArtifacts] = useState([]);
-  const [project, setProject] = useState(emptyProjectSnapshot());
-  const [details, setDetails] = useState(emptyDetailsSnapshot());
-  const [displayUsage, setDisplayUsage] = useState(emptyUsage());
-  const [detailsRefreshing, setDetailsRefreshing] = useState(false);
-  const [plotState, setPlotState] = useState({ options: [], threads: [], activeThreadIds: [], activeIntent: null });
-  const [inspectorView, setInspectorView] = useState(null);
-  const [selectedEntity, setSelectedEntity] = useState(null);
+  const [uiState, dispatchUi] = useReducer(tuiStateReducer, undefined, createInitialTuiState);
+  const {
+    currentChapterId,
+    activeTask,
+    taskPhase,
+    lastResult,
+    lastArtifacts,
+    project,
+    details,
+    displayUsage,
+    detailsRefreshing,
+    plotState,
+    inspectorView,
+    selectedEntity,
+    plotSession,
+    guideSession,
+    transcriptScroll
+  } = uiState;
+  const setCurrentChapterId = createUiSetter(dispatchUi, "currentChapterId");
+  const setActiveTask = createUiSetter(dispatchUi, "activeTask");
+  const setTaskPhase = createUiSetter(dispatchUi, "taskPhase");
+  const setLastResult = createUiSetter(dispatchUi, "lastResult");
+  const setLastArtifacts = createUiSetter(dispatchUi, "lastArtifacts");
+  const setProject = createUiSetter(dispatchUi, "project");
+  const setDetails = createUiSetter(dispatchUi, "details");
+  const setDisplayUsage = createUiSetter(dispatchUi, "displayUsage");
+  const setDetailsRefreshing = createUiSetter(dispatchUi, "detailsRefreshing");
+  const setPlotState = createUiSetter(dispatchUi, "plotState");
+  const setInspectorView = createUiSetter(dispatchUi, "inspectorView");
+  const setSelectedEntity = createUiSetter(dispatchUi, "selectedEntity");
   const [lastCommand, setLastCommand] = useState(null);
   const [suggestionIndex, setSuggestionIndex] = useState(0);
-  const [transcriptScroll, setTranscriptScroll] = useState(0);
   const [commandHistory, setCommandHistory] = useState([]);
   const [historyCursor, setHistoryCursor] = useState(null);
   const [draftInput, setDraftInput] = useState("");
-  const [plotSession, setPlotSession] = useState(null);
-  const [guideSession, setGuideSession] = useState(null);
+  const setTranscriptScroll = createUiSetter(dispatchUi, "transcriptScroll");
+  const setPlotSession = createUiSetter(dispatchUi, "plotSession");
+  const setGuideSession = createUiSetter(dispatchUi, "guideSession");
   const abortRef = useRef(null);
   const usageAnimationRef = useRef({ timer: null });
   const displayUsageRef = useRef(emptyUsage());
@@ -671,55 +690,63 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     }
 
     function handleEvent(event) {
-      switch (event.type) {
-        case "task_started":
-          setActiveTask(event.task || "running");
-          setTaskPhase("started");
-          pushMessage("event", formatTaskStarted(event.task));
-          if (STREAMING_TASKS.has(event.task)) {
-            streamed = true;
-            pushMessage("assistant", "", { streaming: true });
+      runEventHandlerSafely(
+        event,
+        () => {
+          switch (event.type) {
+            case "task_started":
+              setActiveTask(event.task || "running");
+              setTaskPhase("started");
+              pushMessage("event", formatTaskStarted(event.task));
+              if (STREAMING_TASKS.has(event.task)) {
+                streamed = true;
+                pushMessage("assistant", "", { streaming: true });
+              }
+              break;
+            case "phase_changed":
+              setTaskPhase(event.phase);
+              break;
+            case "token":
+              appendStreamingChunk(event.chunk || "");
+              break;
+            case "plot_option_generated":
+              appendStreamingChunk(event.chunk || "");
+              break;
+            case "artifact_written":
+              setLastArtifacts((current) => [...current, event.artifact].slice(-6));
+              pushMessage("event", `Saved ${trimPath(event.artifact)}.`);
+              if (/(chapters\/.+\.(plan|draft)\.md|memory\/)/.test(String(event.artifact || ""))) {
+                void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "artifact-written");
+              }
+              break;
+            case "memory_updated":
+              pushMessage("event", "Memory updated.");
+              void scheduleDetailsRefresh(event.chapterId || latestStateRef.current.currentChapterId, "memory-updated");
+              break;
+            case "plot_options_completed":
+              pushMessage("event", "Plot options generated.");
+              setInspectorView("plot");
+              break;
+            case "plot_option_status_changed":
+              pushMessage("event", `Plot option updated: ${event.status}.`);
+              void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "plot-status");
+              break;
+            case "plot_option_applied":
+              pushMessage("event", `Active plot intent updated: ${event.activeIntent?.title || event.optionId}.`);
+              void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "plot-applied");
+              break;
+            case "task_completed":
+              setLastResult(event.output || "Done.");
+              pushMessage("result", event.output || "Done.");
+              break;
+            default:
+              break;
           }
-          break;
-        case "phase_changed":
-          setTaskPhase(event.phase);
-          break;
-        case "token":
-          appendStreamingChunk(event.chunk || "");
-          break;
-        case "plot_option_generated":
-          appendStreamingChunk(event.chunk || "");
-          break;
-        case "artifact_written":
-          setLastArtifacts((current) => [...current, event.artifact].slice(-6));
-          pushMessage("event", `Saved ${trimPath(event.artifact)}.`);
-          if (/(chapters\/.+\.(plan|draft)\.md|memory\/)/.test(String(event.artifact || ""))) {
-            void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "artifact-written");
-          }
-          break;
-        case "memory_updated":
-          pushMessage("event", "Memory updated.");
-          void scheduleDetailsRefresh(event.chapterId || latestStateRef.current.currentChapterId, "memory-updated");
-          break;
-        case "plot_options_completed":
-          pushMessage("event", "Plot options generated.");
-          setInspectorView("plot");
-          break;
-        case "plot_option_status_changed":
-          pushMessage("event", `Plot option updated: ${event.status}.`);
-          void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "plot-status");
-          break;
-        case "plot_option_applied":
-          pushMessage("event", `Active plot intent updated: ${event.activeIntent?.title || event.optionId}.`);
-          void scheduleDetailsRefresh(latestStateRef.current.currentChapterId, "plot-applied");
-          break;
-        case "task_completed":
-          setLastResult(event.output || "Done.");
-          pushMessage("result", event.output || "Done.");
-          break;
-        default:
-          break;
-      }
+        },
+        (error, failedEvent) => {
+          reportSoftError("runtime-event", error, `Runtime event handling failed: ${failedEvent?.type || "unknown"}.`);
+        }
+      );
     }
   }
 
@@ -834,33 +861,41 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
     }
 
     function handleEvent(event) {
-      switch (event.type) {
-        case "task_started":
-          setActiveTask(event.task || "running");
-          setTaskPhase("started");
-          pushMessage("event", formatTaskStarted(event.task));
-          if (STREAMING_TASKS.has(event.task)) {
-            pushMessage("assistant", "", { streaming: true });
+      runEventHandlerSafely(
+        event,
+        () => {
+          switch (event.type) {
+            case "task_started":
+              setActiveTask(event.task || "running");
+              setTaskPhase("started");
+              pushMessage("event", formatTaskStarted(event.task));
+              if (STREAMING_TASKS.has(event.task)) {
+                pushMessage("assistant", "", { streaming: true });
+              }
+              break;
+            case "phase_changed":
+              setTaskPhase(event.phase);
+              break;
+            case "token":
+            case "plot_option_generated":
+              appendStreamingChunk(event.chunk || "");
+              break;
+            case "artifact_written":
+              setLastArtifacts((current) => [...current, event.artifact].slice(-6));
+              pushMessage("event", `Saved ${trimPath(event.artifact)}.`);
+              break;
+            case "task_completed":
+              setLastResult(event.output || "Done.");
+              pushMessage("result", event.output || "Done.");
+              break;
+            default:
+              break;
           }
-          break;
-        case "phase_changed":
-          setTaskPhase(event.phase);
-          break;
-        case "token":
-        case "plot_option_generated":
-          appendStreamingChunk(event.chunk || "");
-          break;
-        case "artifact_written":
-          setLastArtifacts((current) => [...current, event.artifact].slice(-6));
-          pushMessage("event", `Saved ${trimPath(event.artifact)}.`);
-          break;
-        case "task_completed":
-          setLastResult(event.output || "Done.");
-          pushMessage("result", event.output || "Done.");
-          break;
-        default:
-          break;
-      }
+        },
+        (error, failedEvent) => {
+          reportSoftError("guided-runtime-event", error, `Runtime event handling failed: ${failedEvent?.type || "unknown"}.`);
+        }
+      );
     }
   }
 
@@ -959,6 +994,52 @@ function TuiApp({ runCommand, renderProfile, helpText, onStateChange }) {
   }
 }
 
+function createInitialTuiState() {
+  return {
+    currentChapterId: null,
+    activeTask: null,
+    taskPhase: "idle",
+    lastResult: "Ready.",
+    lastArtifacts: [],
+    project: emptyProjectSnapshot(),
+    details: emptyDetailsSnapshot(),
+    displayUsage: emptyUsage(),
+    detailsRefreshing: false,
+    plotState: { options: [], threads: [], activeThreadIds: [], activeIntent: null },
+    inspectorView: null,
+    selectedEntity: null,
+    transcriptScroll: 0,
+    plotSession: null,
+    guideSession: null
+  };
+}
+
+function tuiStateReducer(state, action) {
+  if (action.type !== "set") {
+    return state;
+  }
+
+  const nextValue = typeof action.updater === "function" ? action.updater(state[action.key]) : action.updater;
+  if (state[action.key] === nextValue) {
+    return state;
+  }
+
+  return {
+    ...state,
+    [action.key]: nextValue
+  };
+}
+
+function createUiSetter(dispatch, key) {
+  return (updater) => {
+    dispatch({
+      type: "set",
+      key,
+      updater
+    });
+  };
+}
+
 class TuiErrorBoundary extends React.Component {
   constructor(props) {
     super(props);
@@ -983,6 +1064,16 @@ class TuiErrorBoundary extends React.Component {
       );
     }
     return this.props.children;
+  }
+}
+
+export function runEventHandlerSafely(event, handler, onError = () => {}) {
+  try {
+    handler(event);
+    return true;
+  } catch (error) {
+    onError(error, event);
+    return false;
   }
 }
 

@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { readText, writeText } from "./fs.js";
 import { generateText } from "./llm.js";
-import { buildContext } from "./memory.js";
+import { buildContext } from "./memory/context.js";
 import { buildPlotOptionsPrompt, extractTaggedSections } from "./prompts.js";
 import { buildFallbackPlotOptions } from "./templates.js";
 import { loadProjectConfig, resolveProjectPaths } from "./project.js";
@@ -21,7 +22,7 @@ export async function loadPlotState(rootDir = process.cwd()) {
 
 export async function savePlotState(rootDir, state) {
   const paths = resolveProjectPaths(rootDir);
-  const normalized = migratePlotState(state);
+  const normalized = normalizePlotState(migratePlotState(state));
   await writeText(paths.plotOptions, `${JSON.stringify(normalized, null, 2)}\n`);
   return paths.plotOptions;
 }
@@ -72,15 +73,6 @@ export async function changePlotOptionStatus(rootDir, optionId, status, options 
     thread = upsertThreadFromOption(plotState, option, options.chapterId);
     option.threadId = thread.id;
     activateThread(plotState, thread.id);
-    plotState.activeIntent = {
-      plotOptionId: option.id,
-      threadId: thread.id,
-      scope: thread.scope,
-      chapterId: thread.originChapterId,
-      summary: thread.summary,
-      title: thread.title,
-      appliedAt: thread.appliedAt
-    };
     for (const item of plotState.options) {
       if (item.id !== option.id && item.status === "applied") {
         item.status = "kept";
@@ -88,9 +80,10 @@ export async function changePlotOptionStatus(rootDir, optionId, status, options 
     }
   }
 
-  if (status === "dropped" && plotState.activeIntent?.plotOptionId === optionId) {
-    plotState.activeIntent = null;
-  }
+  normalizePlotState(plotState, {
+    preferredThreadId: thread?.id || option.threadId || null,
+    preferredOptionId: status === "applied" ? option.id : null
+  });
 
   const artifact = await savePlotState(rootDir, plotState);
   return { option, thread, plotState, artifact };
@@ -113,7 +106,9 @@ export async function changePlotThreadStatus(rootDir, threadId, status, chapterI
   if (status === "resolved") {
     thread.resolvedInChapterId = chapterId ? String(chapterId).padStart(3, "0") : thread.latestChapterId || null;
   }
-  plotState.activeIntent = buildLegacyActiveIntent(plotState);
+  normalizePlotState(plotState, {
+    preferredThreadId: status === "active" ? thread.id : null
+  });
   const artifact = await savePlotState(rootDir, plotState);
   return { thread, plotState, artifact };
 }
@@ -188,7 +183,7 @@ export async function buildIntentContext(rootDir, chapterId) {
 
 export function makePlotOptionId(scope, chapterId, index) {
   const chapter = scope === "chapter" ? `-${String(chapterId).padStart(3, "0")}` : "";
-  return `${scope}${chapter}-${Date.now()}-${index + 1}`;
+  return `${scope}${chapter}-${randomUUID()}-${index + 1}`;
 }
 
 function emptyPlotState() {
@@ -227,8 +222,9 @@ function migratePlotState(parsed) {
     thread.appliesToChapters = normalizeChapterRange(thread.appliesToChapters, thread.originChapterId, thread.scope);
     thread.history = Array.isArray(thread.history) ? thread.history : [];
   }
-  base.activeIntent = buildLegacyActiveIntent(base);
-  return base;
+  return normalizePlotState(base, {
+    storedActiveIntent: parsed?.activeIntent || null
+  });
 }
 
 async function buildPlotContext(rootDir, scope, chapterId) {
@@ -391,7 +387,7 @@ function upsertThreadFromOption(plotState, option, chapterId) {
     existing.tags = dedupeStrings([...(existing.tags || []), ...(option.tags || [])]);
     existing.relatedEntityIds = dedupeStrings([...(existing.relatedEntityIds || []), ...(option.relatedEntityIds || [])]);
     existing.latestChapterId = String(chapterId || option.chapterId || existing.latestChapterId || "").padStart(3, "0") || existing.latestChapterId;
-    existing.history = [...(existing.history || []), buildThreadHistoryEvent("reapplied", chapterId || option.chapterId)];
+    existing.history = [...(existing.history || []), buildThreadHistoryEvent("reapplied", chapterId || option.chapterId, option.id)];
     return existing;
   }
 
@@ -497,12 +493,80 @@ function formatThreadRange(thread) {
 }
 
 function buildLegacyActiveIntent(plotState) {
-  const thread = getRelevantActiveThreads(plotState, null)[0] || plotState.threads.find((item) => item.status === "active") || null;
+  const candidateThreads = getRelevantActiveThreads(plotState, null);
+  const activeThreads = candidateThreads.length > 0 ? candidateThreads : plotState.threads.filter((item) => item.status === "active");
+  const selected = activeThreads
+    .map((thread) => ({
+      thread,
+      sourceEvent: getLatestSourceEvent(plotState, thread)
+    }))
+    .sort((left, right) => {
+      const leftAt = left.sourceEvent?.at || left.thread.appliedAt || "";
+      const rightAt = right.sourceEvent?.at || right.thread.appliedAt || "";
+      return rightAt.localeCompare(leftAt);
+    })[0];
+
+  if (!selected?.thread) {
+    return null;
+  }
+  return buildActiveIntentFromThread(plotState, selected.thread, selected.sourceEvent);
+}
+
+function normalizeStoredActiveIntent(plotState, activeIntent) {
+  if (!activeIntent?.threadId) {
+    return null;
+  }
+
+  const thread = plotState.threads.find((item) => item.id === activeIntent.threadId && item.status === "active");
   if (!thread) {
     return null;
   }
+
+  const sourceEvent = getLatestSourceEvent(plotState, thread, activeIntent.plotOptionId);
+  return buildActiveIntentFromThread(plotState, thread, sourceEvent, activeIntent.plotOptionId);
+}
+
+function normalizePlotState(plotState, options = {}) {
+  plotState.activeThreadIds = dedupeStrings(plotState.activeThreadIds || []).filter((threadId) =>
+    plotState.threads.some((item) => item.id === threadId && item.status === "active")
+  );
+
+  for (const thread of plotState.threads || []) {
+    thread.tags = dedupeStrings(thread.tags || []);
+    thread.relatedEntityIds = dedupeStrings(thread.relatedEntityIds || []);
+    thread.relatedLoopIds = dedupeStrings(thread.relatedLoopIds || []);
+    thread.history = Array.isArray(thread.history) ? thread.history : [];
+    thread.appliesToChapters = normalizeChapterRange(thread.appliesToChapters, thread.originChapterId, thread.scope);
+  }
+
+  const preferredThread = options.preferredThreadId
+    ? plotState.threads.find((item) => item.id === options.preferredThreadId && item.status === "active")
+    : null;
+  const preferredOption = options.preferredOptionId
+    ? plotState.options.find((item) => item.id === options.preferredOptionId && item.status !== "dropped")
+    : null;
+  const preferredIntent = preferredThread
+    ? buildActiveIntentFromThread(plotState, preferredThread, getLatestSourceEvent(plotState, preferredThread, preferredOption?.id))
+    : preferredOption?.threadId
+      ? normalizeStoredActiveIntent(plotState, { threadId: preferredOption.threadId, plotOptionId: preferredOption.id })
+      : null;
+
+  plotState.activeIntent =
+    preferredIntent ||
+    normalizeStoredActiveIntent(plotState, options.storedActiveIntent || plotState.activeIntent) ||
+    buildLegacyActiveIntent(plotState);
+
+  return plotState;
+}
+
+function buildActiveIntentFromThread(plotState, thread, sourceEvent = null, preferredOptionId = null) {
+  if (!thread || thread.status !== "active") {
+    return null;
+  }
+
+  const resolvedSourceEvent = sourceEvent || getLatestSourceEvent(plotState, thread, preferredOptionId);
   return {
-    plotOptionId: thread.history?.find((item) => item.action === "applied")?.sourceOptionId || null,
+    plotOptionId: preferredOptionId || resolvedSourceEvent?.sourceOptionId || null,
     threadId: thread.id,
     scope: thread.scope,
     chapterId: thread.originChapterId,
@@ -510,6 +574,26 @@ function buildLegacyActiveIntent(plotState) {
     title: thread.title,
     appliedAt: thread.appliedAt
   };
+}
+
+function getLatestSourceEvent(plotState, thread, preferredOptionId = null) {
+  const activeOptionIds = new Set(
+    (plotState.options || [])
+      .filter((item) => item.status !== "dropped")
+      .map((item) => item.id)
+  );
+  const history = [...(thread.history || [])].reverse();
+
+  if (preferredOptionId && activeOptionIds.has(preferredOptionId)) {
+    const preferredEvent = history.find(
+      (item) => ["applied", "reapplied"].includes(item.action) && item.sourceOptionId === preferredOptionId
+    );
+    if (preferredEvent) {
+      return preferredEvent;
+    }
+  }
+
+  return history.find((item) => ["applied", "reapplied"].includes(item.action) && activeOptionIds.has(item.sourceOptionId));
 }
 
 function buildThreadHistoryEvent(action, chapterId = null, sourceOptionId = null) {

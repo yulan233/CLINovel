@@ -11,4 +11,11 @@ test("describeLlmMode reports fallback when api key missing", () => {
   assert.equal(llm.remoteEnabled, false);
   assert.equal(llm.model, "fallback-local");
   assert.equal(llm.maskedApiKey, "(not set)");
+  assert.equal(llm.contextWindow, null);
+});
+
+test("describeLlmMode reports known context windows for supported models", () => {
+  delete process.env.AINOVEL_MODEL;
+  const llm = describeLlmMode({ default_model: "gpt-4.1-mini" });
+  assert.equal(llm.contextWindow, 1047576);
 });
